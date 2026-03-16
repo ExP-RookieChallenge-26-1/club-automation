@@ -71,43 +71,18 @@ jobs:
           const pusher = event.pusher?.name || "unknown";
           const headCommitMessage = event.head_commit?.message || "";
 
-          const IGNORED_EXTENSIONS = new Set([
-            ".png", ".jpg", ".jpeg", ".gif", ".webp",
-            ".mp3", ".wav", ".ogg", ".mp4", ".mov",
-            ".zip", ".rar", ".7z",
-            ".dll", ".exe", ".apk", ".aab", ".so",
-            ".meta"
-          ]);
-
-          const IGNORED_PATH_PATTERNS = [
-            /^Library\//i,
-            /^Temp\//i,
-            /^Logs\//i,
-            /^Obj\//i,
-            /^Build\//i,
-            /^Builds\//i,
-            /^UserSettings\//i,
-            /^node_modules\//i,
-            /^dist\//i,
-            /^bin\//i,
-            /^obj\//i
-          ];
-
-          function getExtension(filename) {
-            const idx = filename.lastIndexOf(".");
-            return idx >= 0 ? filename.slice(idx).toLowerCase() : "";
-          }
-
-          function shouldIgnoreFile(filename) {
-            const ext = getExtension(filename);
-            if (IGNORED_EXTENSIONS.has(ext)) return true;
-            return IGNORED_PATH_PATTERNS.some((regex) => regex.test(filename));
+          if (!before || !after) {
+            throw new Error("before 또는 after SHA가 없음");
           }
 
           function truncate(text, maxLen) {
             if (!text) return "";
             if (text.length <= maxLen) return text;
             return text.slice(0, maxLen) + "\n...[truncated]";
+          }
+
+          function shouldAnalyzeFile(filename) {
+            return filename.toLowerCase().endsWith(".cs");
           }
 
           async function githubFetch(url, options = {}) {
@@ -130,7 +105,8 @@ jobs:
           }
 
           async function createCommitComment(body) {
-            const url = `${githubApiUrl}/repos/${owner}/${repo}/comments`;
+            const url = `${githubApiUrl}/repos/${owner}/${repo}/commits/${after}/comments`;
+
             const res = await fetch(url, {
               method: "POST",
               headers: {
@@ -140,7 +116,6 @@ jobs:
                 "Content-Type": "application/json"
               },
               body: JSON.stringify({
-                commit_sha: after,
                 body
               })
             });
@@ -179,16 +154,17 @@ jobs:
             }).join("\n\n");
 
             return `
-          너는 동아리 대회용 GitHub 자동 코드 리뷰어다.
-          유니티에서 개발하는 상황이다.
-          
-          목표:
-          - 이번 push의 실제 변경 내용만 보고 피드백한다.
-          - 없는 내용 지어내지 마라.
-          - 과한 칭찬 금지.
-          - 문제 없으면 없다고 말해라.
+          너는 Unity 프로젝트 전용 C# 코드 리뷰어다.
+
+          반드시 지킬 규칙:
+          - 이번 push에서 실제로 변경된 C# 코드만 보고 판단한다.
+          - patch에 없는 내용은 지어내지 않는다.
+          - 과한 칭찬은 하지 않는다.
+          - 문제 없으면 없다고 명확히 말한다.
           - 출력은 한국어로 한다.
-          - 실질적인 피드백만 적는다.
+          - 실질적인 수정 포인트 위주로 짧고 명확하게 쓴다.
+          - Unity 프로젝트 기준으로 MonoBehaviour, ScriptableObject, Update 남용, GetComponent 반복 호출, 직렬화 필드 사용, null 가능성, 책임 분리, 매직 넘버, 성능 문제를 우선 점검한다.
+          - 확실하지 않은 부분은 추측하지 말고 "확실하지 않음"이라고 적는다.
 
           출력 형식:
           1. 한 줄 총평
@@ -199,14 +175,16 @@ jobs:
           6. 확실하지 않은 부분
 
           리뷰 기준:
-          - 버그 가능성
+          - null 참조 위험
+          - Unity 생명주기 사용 적절성(Awake/Start/Update/OnEnable 등)
+          - GetComponent, Find 계열 호출 비용
+          - SerializeField / public 노출 적절성
+          - 책임 분리
+          - 하드코딩 / 매직 넘버
+          - 가독성
           - 예외 처리
           - 성능
-          - 가독성
-          - 책임 분리
-          - 하드코딩
-          - 커밋 크기
-          - 불필요 파일 포함 여부
+          - 유지보수성
 
           메타 정보:
           - Repository: ${repoFullName}
@@ -216,7 +194,7 @@ jobs:
           - Commit count in compare: ${commitCount}
           - Total changed files: ${totalFiles}
 
-          분석 대상 파일:
+          분석 대상 C# 파일:
           ${fileSummaries}
           `.trim();
           }
@@ -229,7 +207,7 @@ jobs:
                 "Authorization": `Bearer ${openaiApiKey}`
               },
               body: JSON.stringify({
-                model: "gpt-5",
+                model: "gpt-4.1-mini",
                 input: prompt
               })
             });
@@ -270,7 +248,7 @@ jobs:
               `- 푸시한 사람: **${pusher}**`,
               `- 비교 범위: \`${before.slice(0, 7)}...${after.slice(0, 7)}\``,
               `- 전체 변경 파일 수: **${totalFiles}개**`,
-              `- AI 분석 파일 수: **${selectedFiles.length}개**`,
+              `- AI 분석 C# 파일 수: **${selectedFiles.length}개**`,
               skippedCount > 0 ? `- 제외된 파일 수: **${skippedCount}개**` : null,
               "",
               "### 분석한 파일",
@@ -294,7 +272,7 @@ jobs:
 
           const filtered = files.filter((file) => {
             if (!file.filename) return false;
-            if (shouldIgnoreFile(file.filename)) return false;
+            if (!shouldAnalyzeFile(file.filename)) return false;
             if (!file.patch) return false;
             return true;
           });
@@ -303,7 +281,7 @@ jobs:
           const skippedCount = files.length - selectedFiles.length;
 
           if (selectedFiles.length === 0) {
-            console.log("분석 가능한 텍스트 patch 파일 없음");
+            console.log("분석 가능한 C# patch 파일 없음");
             process.exit(0);
           }
 
