@@ -1,0 +1,318 @@
+name: AI Push Feedback
+
+on:
+  workflow_call:
+    inputs:
+      target_branches:
+        description: "분석할 브랜치 목록(JSON 배열 문자열)"
+        required: false
+        type: string
+        default: '["main","dev","develop"]'
+      max_files:
+        description: "AI에 보낼 최대 파일 수"
+        required: false
+        type: number
+        default: 10
+      max_patch_chars:
+        description: "파일당 최대 patch 길이"
+        required: false
+        type: number
+        default: 4000
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  feedback:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Generate AI feedback and comment on commit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          INPUT_TARGET_BRANCHES: ${{ inputs.target_branches }}
+          INPUT_MAX_FILES: ${{ inputs.max_files }}
+          INPUT_MAX_PATCH_CHARS: ${{ inputs.max_patch_chars }}
+        run: |
+          cat > script.mjs <<'EOF'
+          import fs from "fs";
+
+          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+
+          const githubToken = process.env.GITHUB_TOKEN;
+          const openaiApiKey = process.env.OPENAI_API_KEY;
+          const repoFullName = process.env.GITHUB_REPOSITORY;
+          const githubApiUrl = process.env.GITHUB_API_URL;
+          const targetBranches = JSON.parse(process.env.INPUT_TARGET_BRANCHES || '["main","dev","develop"]');
+          const maxFiles = Number(process.env.INPUT_MAX_FILES || "10");
+          const maxPatchChars = Number(process.env.INPUT_MAX_PATCH_CHARS || "4000");
+
+          if (!repoFullName) throw new Error("GITHUB_REPOSITORY 없음");
+          if (!githubToken) throw new Error("GITHUB_TOKEN 없음");
+          if (!openaiApiKey) throw new Error("OPENAI_API_KEY 없음");
+
+          const [owner, repo] = repoFullName.split("/");
+          const before = event.before;
+          const after = event.after;
+          const ref = event.ref || "";
+          const branch = ref.replace("refs/heads/", "");
+          const pusher = event.pusher?.name || "unknown";
+          const headCommitMessage = event.head_commit?.message || "";
+
+          const IGNORED_EXTENSIONS = new Set([
+            ".png", ".jpg", ".jpeg", ".gif", ".webp",
+            ".mp3", ".wav", ".ogg", ".mp4", ".mov",
+            ".zip", ".rar", ".7z",
+            ".dll", ".exe", ".apk", ".aab", ".so",
+            ".meta"
+          ]);
+
+          const IGNORED_PATH_PATTERNS = [
+            /^Library\//i,
+            /^Temp\//i,
+            /^Logs\//i,
+            /^Obj\//i,
+            /^Build\//i,
+            /^Builds\//i,
+            /^UserSettings\//i,
+            /^node_modules\//i,
+            /^dist\//i,
+            /^bin\//i,
+            /^obj\//i
+          ];
+
+          function getExtension(filename) {
+            const idx = filename.lastIndexOf(".");
+            return idx >= 0 ? filename.slice(idx).toLowerCase() : "";
+          }
+
+          function shouldIgnoreFile(filename) {
+            const ext = getExtension(filename);
+            if (IGNORED_EXTENSIONS.has(ext)) return true;
+            return IGNORED_PATH_PATTERNS.some((regex) => regex.test(filename));
+          }
+
+          function truncate(text, maxLen) {
+            if (!text) return "";
+            if (text.length <= maxLen) return text;
+            return text.slice(0, maxLen) + "\n...[truncated]";
+          }
+
+          async function githubFetch(url, options = {}) {
+            const res = await fetch(url, {
+              ...options,
+              headers: {
+                "Accept": "application/vnd.github+json",
+                "Authorization": `Bearer ${githubToken}`,
+                "X-GitHub-Api-Version": "2022-11-28",
+                ...(options.headers || {})
+              }
+            });
+
+            if (!res.ok) {
+              const text = await res.text();
+              throw new Error(`GitHub API 실패: ${res.status} ${res.statusText}\n${text}`);
+            }
+
+            return res.json();
+          }
+
+          async function createCommitComment(body) {
+            const url = `${githubApiUrl}/repos/${owner}/${repo}/comments`;
+            const res = await fetch(url, {
+              method: "POST",
+              headers: {
+                "Accept": "application/vnd.github+json",
+                "Authorization": `Bearer ${githubToken}`,
+                "X-GitHub-Api-Version": "2022-11-28",
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({
+                commit_sha: after,
+                body
+              })
+            });
+
+            if (!res.ok) {
+              const text = await res.text();
+              throw new Error(`커밋 댓글 생성 실패: ${res.status} ${res.statusText}\n${text}`);
+            }
+
+            return res.json();
+          }
+
+          async function getCompareData() {
+            const url = `${githubApiUrl}/repos/${owner}/${repo}/compare/${before}...${after}`;
+            return githubFetch(url);
+          }
+
+          function buildPrompt(compareData, selectedFiles) {
+            const commitCount = compareData.commits?.length || 0;
+            const totalFiles = compareData.files?.length || 0;
+
+            const fileSummaries = selectedFiles.map((file, index) => {
+              return [
+                `### File ${index + 1}`,
+                `Path: ${file.filename}`,
+                `Status: ${file.status}`,
+                `Additions: ${file.additions ?? 0}`,
+                `Deletions: ${file.deletions ?? 0}`,
+                `Changes: ${file.changes ?? 0}`,
+                "",
+                "Patch:",
+                "```diff",
+                truncate(file.patch || "[patch unavailable]", maxPatchChars),
+                "```"
+              ].join("\n");
+            }).join("\n\n");
+
+            return `
+          너는 동아리 대회용 GitHub 자동 코드 리뷰어다.
+          유니티에서 개발하는 상황이다.
+          
+          목표:
+          - 이번 push의 실제 변경 내용만 보고 피드백한다.
+          - 없는 내용 지어내지 마라.
+          - 과한 칭찬 금지.
+          - 문제 없으면 없다고 말해라.
+          - 출력은 한국어로 한다.
+          - 실질적인 피드백만 적는다.
+
+          출력 형식:
+          1. 한 줄 총평
+          2. 좋은 점
+          3. 문제점
+          4. 수정 제안
+          5. 위험도: low / medium / high
+          6. 확실하지 않은 부분
+
+          리뷰 기준:
+          - 버그 가능성
+          - 예외 처리
+          - 성능
+          - 가독성
+          - 책임 분리
+          - 하드코딩
+          - 커밋 크기
+          - 불필요 파일 포함 여부
+
+          메타 정보:
+          - Repository: ${repoFullName}
+          - Branch: ${branch}
+          - Pusher: ${pusher}
+          - Head commit message: ${headCommitMessage}
+          - Commit count in compare: ${commitCount}
+          - Total changed files: ${totalFiles}
+
+          분석 대상 파일:
+          ${fileSummaries}
+          `.trim();
+          }
+
+          async function callOpenAI(prompt) {
+            const res = await fetch("https://api.openai.com/v1/responses", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${openaiApiKey}`
+              },
+              body: JSON.stringify({
+                model: "gpt-5",
+                input: prompt
+              })
+            });
+
+            if (!res.ok) {
+              const text = await res.text();
+              throw new Error(`OpenAI API 실패: ${res.status} ${res.statusText}\n${text}`);
+            }
+
+            const data = await res.json();
+
+            if (typeof data.output_text === "string" && data.output_text.trim()) {
+              return data.output_text.trim();
+            }
+
+            const parts = [];
+            for (const item of data.output || []) {
+              for (const content of item.content || []) {
+                if (content.type === "output_text" && content.text) {
+                  parts.push(content.text);
+                }
+              }
+            }
+
+            const text = parts.join("\n").trim();
+            if (!text) throw new Error("OpenAI 응답 텍스트 추출 실패");
+            return text;
+          }
+
+          function buildFinalComment(aiText, compareData, selectedFiles, skippedCount) {
+            const fileList = selectedFiles.map(f => `- \`${f.filename}\``).join("\n");
+            const totalFiles = compareData.files?.length || 0;
+
+            return [
+              "## AI 자동 피드백",
+              "",
+              `- 브랜치: \`${branch}\``,
+              `- 푸시한 사람: **${pusher}**`,
+              `- 비교 범위: \`${before.slice(0, 7)}...${after.slice(0, 7)}\``,
+              `- 전체 변경 파일 수: **${totalFiles}개**`,
+              `- AI 분석 파일 수: **${selectedFiles.length}개**`,
+              skippedCount > 0 ? `- 제외된 파일 수: **${skippedCount}개**` : null,
+              "",
+              "### 분석한 파일",
+              fileList || "- 없음",
+              "",
+              "### 피드백",
+              aiText,
+              "",
+              "> 이 댓글은 GitHub Actions + OpenAI API로 자동 생성되었습니다."
+            ].filter(Boolean).join("\n");
+          }
+
+          const branchAllowed = targetBranches.includes(branch);
+          if (!branchAllowed) {
+            console.log(`브랜치 ${branch} 는 분석 대상 아님`);
+            process.exit(0);
+          }
+
+          const compareData = await getCompareData();
+          const files = compareData.files || [];
+
+          const filtered = files.filter((file) => {
+            if (!file.filename) return false;
+            if (shouldIgnoreFile(file.filename)) return false;
+            if (!file.patch) return false;
+            return true;
+          });
+
+          const selectedFiles = filtered.slice(0, maxFiles);
+          const skippedCount = files.length - selectedFiles.length;
+
+          if (selectedFiles.length === 0) {
+            console.log("분석 가능한 텍스트 patch 파일 없음");
+            process.exit(0);
+          }
+
+          const prompt = buildPrompt(compareData, selectedFiles);
+          const aiText = await callOpenAI(prompt);
+          const commentBody = buildFinalComment(aiText, compareData, selectedFiles, skippedCount);
+
+          await createCommitComment(commentBody);
+          console.log("AI 피드백 댓글 작성 완료");
+          EOF
+
+          node script.mjs
