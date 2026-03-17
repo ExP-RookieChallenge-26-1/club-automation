@@ -55,6 +55,8 @@ jobs:
           cat > script.mjs <<'EOF'
           import fs from "fs";
 
+          const AI_COMMENT_MARKER = "<!-- ai-push-feedback:v1 -->";
+
           const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
 
           const githubToken = process.env.GITHUB_TOKEN;
@@ -85,6 +87,14 @@ jobs:
             return filename.toLowerCase().endsWith(".cs");
           }
 
+          function getCommitTitle(commitMessage) {
+            return (commitMessage || "").split("\n")[0] || "";
+          }
+
+          function isAiCommitTitle(commitMessage) {
+            return getCommitTitle(commitMessage).startsWith("[AI]");
+          }
+
           async function githubFetch(url, options = {}) {
             const res = await fetch(url, {
               ...options,
@@ -106,6 +116,11 @@ jobs:
 
           async function getCommitData(commitSha) {
             const url = `${githubApiUrl}/repos/${owner}/${repo}/commits/${commitSha}`;
+            return githubFetch(url);
+          }
+
+          async function listCommitComments(commitSha) {
+            const url = `${githubApiUrl}/repos/${owner}/${repo}/commits/${commitSha}/comments`;
             return githubFetch(url);
           }
 
@@ -131,12 +146,20 @@ jobs:
             return res.json();
           }
 
-          function buildPrompt(commitData, selectedFiles) {
+          async function hasExistingAiComment(commitSha) {
+            const comments = await listCommitComments(commitSha);
+
+            return (comments || []).some(comment => {
+              const body = comment.body || "";
+              return body.includes(AI_COMMENT_MARKER);
+            });
+          }
+
+          function buildPrompt(commitData, selectedFiles, csFileCount, analyzableCsFileCount) {
             const commitSha = commitData.sha;
             const commitMessage = commitData.commit?.message || "";
-            const commitTitle = commitMessage.split("\n")[0] || "";
+            const commitTitle = getCommitTitle(commitMessage);
             const author = commitData.commit?.author?.name || pusher;
-            const totalFiles = commitData.files?.length || 0;
 
             const fileSummaries = selectedFiles.map((file, index) => {
               return [
@@ -195,7 +218,8 @@ jobs:
           - Commit author: ${author}
           - Commit SHA: ${commitSha}
           - Commit title: ${commitTitle}
-          - Total changed files in commit: ${totalFiles}
+          - Changed C# files in commit: ${csFileCount}
+          - Analyzable C# patch files in commit: ${analyzableCsFileCount}
 
           분석 대상 C# 파일:
           ${fileSummaries}
@@ -222,41 +246,58 @@ jobs:
 
             const data = await res.json();
 
-            if (typeof data.output_text === "string" && data.output_text.trim()) {
-              return data.output_text.trim();
-            }
-
             const parts = [];
-            for (const item of data.output || []) {
-              for (const content of item.content || []) {
-                if (content.type === "output_text" && content.text) {
-                  parts.push(content.text);
+            if (typeof data.output_text === "string" && data.output_text.trim()) {
+              parts.push(data.output_text.trim());
+            } else {
+              for (const item of data.output || []) {
+                for (const content of item.content || []) {
+                  if (content.type === "output_text" && content.text) {
+                    parts.push(content.text);
+                  }
                 }
               }
             }
 
             const text = parts.join("\n").trim();
             if (!text) throw new Error("OpenAI 응답 텍스트 추출 실패");
-            return text;
+
+            const usage = data.usage || {};
+            const inputTokens = usage.input_tokens || 0;
+            const outputTokens = usage.output_tokens || 0;
+
+            const estimatedCost =
+              (inputTokens / 1_000_000) * 0.80 +
+              (outputTokens / 1_000_000) * 3.20;
+
+            return {
+              text,
+              usage: {
+                inputTokens,
+                outputTokens,
+                estimatedCost
+              }
+            };
           }
 
-          function buildFinalComment(aiText, commitData, selectedFiles, skippedCount) {
+          function buildFinalComment(aiText, commitData, selectedFiles, skippedCount, usage, csFileCount, analyzableCsFileCount) {
             const commitSha = commitData.sha;
             const commitMessage = commitData.commit?.message || "";
-            const commitTitle = commitMessage.split("\n")[0] || "";
-            const totalFiles = commitData.files?.length || 0;
+            const commitTitle = getCommitTitle(commitMessage);
             const fileList = selectedFiles.map(f => `- \`${f.filename}\``).join("\n");
 
             return [
+              AI_COMMENT_MARKER,
               "## AI 자동 피드백",
               "",
               `- 브랜치: \`${branch}\``,
               `- 푸시한 사람: **${pusher}**`,
               `- 커밋: \`${commitSha.slice(0, 7)}\``,
               `- 커밋 제목: **${commitTitle}**`,
-              `- 전체 변경 파일 수: **${totalFiles}개**`,
-              `- AI 분석 C# 파일 수: **${selectedFiles.length}개**`,
-              skippedCount > 0 ? `- 제외된 파일 수: **${skippedCount}개**` : null,
+              `- 변경된 C# 파일 수: **${csFileCount}개**`,
+              `- 분석 가능한 C# patch 파일 수: **${analyzableCsFileCount}개**`,
+              `- 실제 AI 분석 C# 파일 수: **${selectedFiles.length}개**`,
+              skippedCount > 0 ? `- 분석 제외된 C# patch 파일 수: **${skippedCount}개**` : null,
               "",
               "### 분석한 파일",
               fileList || "- 없음",
@@ -264,13 +305,13 @@ jobs:
               "### 피드백",
               aiText,
               "",
+              "### 사용량",
+              `- 입력 토큰: **${usage.inputTokens}**`,
+              `- 출력 토큰: **${usage.outputTokens}**`,
+              `- 예상 비용(USD): **${usage.estimatedCost.toFixed(6)}**`,
+              "",
               "> 이 댓글은 GitHub Actions + OpenAI API로 자동 생성되었습니다."
             ].filter(Boolean).join("\n");
-          }
-
-          function isAiCommitTitle(commitMessage) {
-            const title = (commitMessage || "").split("\n")[0] || "";
-            return title.startsWith("[AI]");
           }
 
           const branchAllowed = targetBranches.includes(branch);
@@ -287,37 +328,70 @@ jobs:
           console.log("전달받은 [AI] 커밋 SHA 목록:", filteredCommitShas);
 
           for (const commitSha of filteredCommitShas) {
-            console.log(`\\n=== 커밋 분석 시작: ${commitSha} ===`);
+            console.log(`\n=== 커밋 분석 시작: ${commitSha} ===`);
 
             const commitData = await getCommitData(commitSha);
             const commitMessage = commitData.commit?.message || "";
-            const commitTitle = commitMessage.split("\n")[0] || "";
+            const commitTitle = getCommitTitle(commitMessage);
 
             if (!isAiCommitTitle(commitMessage)) {
               console.log(`스킵: [AI] 커밋이 아님 - ${commitTitle}`);
               continue;
             }
 
+            const alreadyCommented = await hasExistingAiComment(commitSha);
+            if (alreadyCommented) {
+              console.log(`스킵: 이미 AI 댓글이 존재함 - ${commitSha}`);
+              continue;
+            }
+
             const files = commitData.files || [];
 
-            const filtered = files.filter((file) => {
+            // .cs 파일만 추림
+            const csFiles = files.filter((file) => {
               if (!file.filename) return false;
-              if (!shouldAnalyzeFile(file.filename)) return false;
-              if (!file.patch) return false;
-              return true;
+              return shouldAnalyzeFile(file.filename);
             });
 
-            const selectedFiles = filtered.slice(0, maxFiles);
-            const skippedCount = files.length - selectedFiles.length;
+            // .cs 중에서 실제 patch가 있는 파일만 추림
+            const analyzableCsFiles = csFiles.filter((file) => {
+              return !!file.patch;
+            });
 
-            if (selectedFiles.length === 0) {
+            const csFileCount = csFiles.length;
+            const analyzableCsFileCount = analyzableCsFiles.length;
+
+            if (analyzableCsFileCount === 0) {
               console.log(`분석 가능한 C# patch 파일 없음: ${commitSha}`);
               continue;
             }
 
-            const prompt = buildPrompt(commitData, selectedFiles);
-            const aiText = await callOpenAI(prompt);
-            const commentBody = buildFinalComment(aiText, commitData, selectedFiles, skippedCount);
+            const selectedFiles = analyzableCsFiles.slice(0, maxFiles);
+            const skippedCount = analyzableCsFileCount - selectedFiles.length;
+
+            const prompt = buildPrompt(
+              commitData,
+              selectedFiles,
+              csFileCount,
+              analyzableCsFileCount
+            );
+
+            const aiResult = await callOpenAI(prompt);
+            const aiText = aiResult.text;
+
+            console.log(
+              `[COST] commit=${commitSha} input_tokens=${aiResult.usage.inputTokens} output_tokens=${aiResult.usage.outputTokens} estimated_usd=${aiResult.usage.estimatedCost.toFixed(6)}`
+            );
+
+            const commentBody = buildFinalComment(
+              aiText,
+              commitData,
+              selectedFiles,
+              skippedCount,
+              aiResult.usage,
+              csFileCount,
+              analyzableCsFileCount
+            );
 
             await createCommitComment(commitSha, commentBody);
             console.log(`AI 피드백 댓글 작성 완료: ${commitSha}`);
