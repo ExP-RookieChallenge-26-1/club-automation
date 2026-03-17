@@ -9,7 +9,7 @@ on:
         type: string
         default: '["main","dev","develop"]'
       max_files:
-        description: "AI에 보낼 최대 파일 수"
+        description: "커밋당 AI에 보낼 최대 파일 수"
         required: false
         type: number
         default: 10
@@ -18,6 +18,11 @@ on:
         required: false
         type: number
         default: 4000
+      filtered_commit_shas:
+        description: "[AI]가 붙은 커밋 SHA 목록(JSON 배열 문자열)"
+        required: false
+        type: string
+        default: "[]"
     secrets:
       OPENAI_API_KEY:
         required: true
@@ -35,7 +40,7 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Generate AI feedback and comment on commit
+      - name: Generate AI feedback and comment on AI commits
         env:
           GITHUB_TOKEN: ${{ github.token }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -45,6 +50,7 @@ jobs:
           INPUT_TARGET_BRANCHES: ${{ inputs.target_branches }}
           INPUT_MAX_FILES: ${{ inputs.max_files }}
           INPUT_MAX_PATCH_CHARS: ${{ inputs.max_patch_chars }}
+          INPUT_FILTERED_COMMIT_SHAS: ${{ inputs.filtered_commit_shas }}
         run: |
           cat > script.mjs <<'EOF'
           import fs from "fs";
@@ -58,22 +64,16 @@ jobs:
           const targetBranches = JSON.parse(process.env.INPUT_TARGET_BRANCHES || '["main","dev","develop"]');
           const maxFiles = Number(process.env.INPUT_MAX_FILES || "10");
           const maxPatchChars = Number(process.env.INPUT_MAX_PATCH_CHARS || "4000");
+          const filteredCommitShas = JSON.parse(process.env.INPUT_FILTERED_COMMIT_SHAS || "[]");
 
           if (!repoFullName) throw new Error("GITHUB_REPOSITORY 없음");
           if (!githubToken) throw new Error("GITHUB_TOKEN 없음");
           if (!openaiApiKey) throw new Error("OPENAI_API_KEY 없음");
 
           const [owner, repo] = repoFullName.split("/");
-          const before = event.before;
-          const after = event.after;
           const ref = event.ref || "";
           const branch = ref.replace("refs/heads/", "");
           const pusher = event.pusher?.name || "unknown";
-          const headCommitMessage = event.head_commit?.message || "";
-
-          if (!before || !after) {
-            throw new Error("before 또는 after SHA가 없음");
-          }
 
           function truncate(text, maxLen) {
             if (!text) return "";
@@ -104,8 +104,13 @@ jobs:
             return res.json();
           }
 
-          async function createCommitComment(body) {
-            const url = `${githubApiUrl}/repos/${owner}/${repo}/commits/${after}/comments`;
+          async function getCommitData(commitSha) {
+            const url = `${githubApiUrl}/repos/${owner}/${repo}/commits/${commitSha}`;
+            return githubFetch(url);
+          }
+
+          async function createCommitComment(commitSha, body) {
+            const url = `${githubApiUrl}/repos/${owner}/${repo}/commits/${commitSha}/comments`;
 
             const res = await fetch(url, {
               method: "POST",
@@ -115,27 +120,23 @@ jobs:
                 "X-GitHub-Api-Version": "2022-11-28",
                 "Content-Type": "application/json"
               },
-              body: JSON.stringify({
-                body
-              })
+              body: JSON.stringify({ body })
             });
 
             if (!res.ok) {
               const text = await res.text();
-              throw new Error(`커밋 댓글 생성 실패: ${res.status} ${res.statusText}\n${text}`);
+              throw new Error(`커밋 댓글 생성 실패 (${commitSha}): ${res.status} ${res.statusText}\n${text}`);
             }
 
             return res.json();
           }
 
-          async function getCompareData() {
-            const url = `${githubApiUrl}/repos/${owner}/${repo}/compare/${before}...${after}`;
-            return githubFetch(url);
-          }
-
-          function buildPrompt(compareData, selectedFiles) {
-            const commitCount = compareData.commits?.length || 0;
-            const totalFiles = compareData.files?.length || 0;
+          function buildPrompt(commitData, selectedFiles) {
+            const commitSha = commitData.sha;
+            const commitMessage = commitData.commit?.message || "";
+            const commitTitle = commitMessage.split("\n")[0] || "";
+            const author = commitData.commit?.author?.name || pusher;
+            const totalFiles = commitData.files?.length || 0;
 
             const fileSummaries = selectedFiles.map((file, index) => {
               return [
@@ -157,7 +158,8 @@ jobs:
           너는 Unity 프로젝트 전용 C# 코드 리뷰어다.
 
           반드시 지킬 규칙:
-          - 이번 push에서 실제로 변경된 C# 코드만 보고 판단한다.
+          - 이번 분석 대상은 하나의 커밋이다.
+          - 이 커밋에서 실제로 변경된 C# patch만 보고 판단한다.
           - patch에 없는 내용은 지어내지 않는다.
           - 과한 칭찬은 하지 않는다.
           - 문제 없으면 없다고 명확히 말한다.
@@ -190,9 +192,10 @@ jobs:
           - Repository: ${repoFullName}
           - Branch: ${branch}
           - Pusher: ${pusher}
-          - Head commit message: ${headCommitMessage}
-          - Commit count in compare: ${commitCount}
-          - Total changed files: ${totalFiles}
+          - Commit author: ${author}
+          - Commit SHA: ${commitSha}
+          - Commit title: ${commitTitle}
+          - Total changed files in commit: ${totalFiles}
 
           분석 대상 C# 파일:
           ${fileSummaries}
@@ -237,16 +240,20 @@ jobs:
             return text;
           }
 
-          function buildFinalComment(aiText, compareData, selectedFiles, skippedCount) {
+          function buildFinalComment(aiText, commitData, selectedFiles, skippedCount) {
+            const commitSha = commitData.sha;
+            const commitMessage = commitData.commit?.message || "";
+            const commitTitle = commitMessage.split("\n")[0] || "";
+            const totalFiles = commitData.files?.length || 0;
             const fileList = selectedFiles.map(f => `- \`${f.filename}\``).join("\n");
-            const totalFiles = compareData.files?.length || 0;
 
             return [
               "## AI 자동 피드백",
               "",
               `- 브랜치: \`${branch}\``,
               `- 푸시한 사람: **${pusher}**`,
-              `- 비교 범위: \`${before.slice(0, 7)}...${after.slice(0, 7)}\``,
+              `- 커밋: \`${commitSha.slice(0, 7)}\``,
+              `- 커밋 제목: **${commitTitle}**`,
               `- 전체 변경 파일 수: **${totalFiles}개**`,
               `- AI 분석 C# 파일 수: **${selectedFiles.length}개**`,
               skippedCount > 0 ? `- 제외된 파일 수: **${skippedCount}개**` : null,
@@ -261,36 +268,62 @@ jobs:
             ].filter(Boolean).join("\n");
           }
 
+          function isAiCommitTitle(commitMessage) {
+            const title = (commitMessage || "").split("\n")[0] || "";
+            return title.startsWith("[AI]");
+          }
+
           const branchAllowed = targetBranches.includes(branch);
           if (!branchAllowed) {
             console.log(`브랜치 ${branch} 는 분석 대상 아님`);
             process.exit(0);
           }
 
-          const compareData = await getCompareData();
-          const files = compareData.files || [];
-
-          const filtered = files.filter((file) => {
-            if (!file.filename) return false;
-            if (!shouldAnalyzeFile(file.filename)) return false;
-            if (!file.patch) return false;
-            return true;
-          });
-
-          const selectedFiles = filtered.slice(0, maxFiles);
-          const skippedCount = files.length - selectedFiles.length;
-
-          if (selectedFiles.length === 0) {
-            console.log("분석 가능한 C# patch 파일 없음");
+          if (!Array.isArray(filteredCommitShas) || filteredCommitShas.length === 0) {
+            console.log("[AI] 커밋 SHA가 전달되지 않음");
             process.exit(0);
           }
 
-          const prompt = buildPrompt(compareData, selectedFiles);
-          const aiText = await callOpenAI(prompt);
-          const commentBody = buildFinalComment(aiText, compareData, selectedFiles, skippedCount);
+          console.log("전달받은 [AI] 커밋 SHA 목록:", filteredCommitShas);
 
-          await createCommitComment(commentBody);
-          console.log("AI 피드백 댓글 작성 완료");
+          for (const commitSha of filteredCommitShas) {
+            console.log(`\n=== 커밋 분석 시작: ${commitSha} ===`);
+
+            const commitData = await getCommitData(commitSha);
+            const commitMessage = commitData.commit?.message || "";
+            const commitTitle = commitMessage.split("\n")[0] || "";
+
+            if (!isAiCommitTitle(commitMessage)) {
+              console.log(`스킵: [AI] 커밋이 아님 - ${commitTitle}`);
+              continue;
+            }
+
+            const files = commitData.files || [];
+
+            const filtered = files.filter((file) => {
+              if (!file.filename) return false;
+              if (!shouldAnalyzeFile(file.filename)) return false;
+              if (!file.patch) return false;
+              return true;
+            });
+
+            const selectedFiles = filtered.slice(0, maxFiles);
+            const skippedCount = files.length - selectedFiles.length;
+
+            if (selectedFiles.length === 0) {
+              console.log(`분석 가능한 C# patch 파일 없음: ${commitSha}`);
+              continue;
+            }
+
+            const prompt = buildPrompt(commitData, selectedFiles);
+            const aiText = await callOpenAI(prompt);
+            const commentBody = buildFinalComment(aiText, commitData, selectedFiles, skippedCount);
+
+            await createCommitComment(commitSha, commentBody);
+            console.log(`AI 피드백 댓글 작성 완료: ${commitSha}`);
+          }
+
+          console.log("모든 [AI] 커밋 분석 완료");
           EOF
 
           node script.mjs
