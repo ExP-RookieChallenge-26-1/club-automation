@@ -1,0 +1,378 @@
+name: AI Merge Summary
+
+on:
+  workflow_call:
+    inputs:
+      target_branches:
+        description: "분석할 브랜치 목록(JSON 배열 문자열)"
+        required: false
+        type: string
+        default: '["main","dev","develop"]'
+      max_files:
+        description: "커밋당 AI에 보낼 최대 파일 수"
+        required: false
+        type: number
+        default: 10
+      max_patch_chars:
+        description: "파일당 최대 patch 길이"
+        required: false
+        type: number
+        default: 4000
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  summarize-merge-commits:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Generate AI merge summaries
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          INPUT_TARGET_BRANCHES: ${{ inputs.target_branches }}
+          INPUT_MAX_FILES: ${{ inputs.max_files }}
+          INPUT_MAX_PATCH_CHARS: ${{ inputs.max_patch_chars }}
+        run: |
+          cat > script.mjs <<'EOF'
+          import fs from "fs";
+
+          const AI_COMMENT_MARKER = "<!-- ai-merge-summary:v1 -->";
+
+          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+
+          const githubToken = process.env.GITHUB_TOKEN;
+          const openaiApiKey = process.env.OPENAI_API_KEY;
+          const repoFullName = process.env.GITHUB_REPOSITORY;
+          const githubApiUrl = process.env.GITHUB_API_URL;
+          const targetBranches = JSON.parse(process.env.INPUT_TARGET_BRANCHES || '["main","dev","develop"]');
+          const maxFiles = Number(process.env.INPUT_MAX_FILES || "10");
+          const maxPatchChars = Number(process.env.INPUT_MAX_PATCH_CHARS || "4000");
+
+          if (!repoFullName) throw new Error("GITHUB_REPOSITORY 없음");
+          if (!githubToken) throw new Error("GITHUB_TOKEN 없음");
+          if (!openaiApiKey) throw new Error("OPENAI_API_KEY 없음");
+
+          const [owner, repo] = repoFullName.split("/");
+          const ref = event.ref || "";
+          const branch = ref.replace("refs/heads/", "");
+          const pusher = event.pusher?.name || "unknown";
+          const pushedCommits = Array.isArray(event.commits) ? event.commits : [];
+
+          function truncate(text, maxLen) {
+            if (!text) return "";
+            if (text.length <= maxLen) return text;
+            return text.slice(0, maxLen) + "\n...[truncated]";
+          }
+
+          function shouldAnalyzeFile(filename) {
+            return filename.toLowerCase().endsWith(".cs");
+          }
+
+          function getCommitTitle(commitMessage) {
+            return (commitMessage || "").split("\n")[0] || "";
+          }
+
+          async function githubFetch(url, options = {}) {
+            const res = await fetch(url, {
+              ...options,
+              headers: {
+                "Accept": "application/vnd.github+json",
+                "Authorization": `Bearer ${githubToken}`,
+                "X-GitHub-Api-Version": "2022-11-28",
+                ...(options.headers || {})
+              }
+            });
+
+            if (!res.ok) {
+              const text = await res.text();
+              throw new Error(`GitHub API 실패: ${res.status} ${res.statusText}\n${text}`);
+            }
+
+            return res.json();
+          }
+
+          async function getCommitData(commitSha) {
+            const url = `${githubApiUrl}/repos/${owner}/${repo}/commits/${commitSha}`;
+            return githubFetch(url);
+          }
+
+          async function listCommitComments(commitSha) {
+            const url = `${githubApiUrl}/repos/${owner}/${repo}/commits/${commitSha}/comments`;
+            return githubFetch(url);
+          }
+
+          async function createCommitComment(commitSha, body) {
+            const url = `${githubApiUrl}/repos/${owner}/${repo}/commits/${commitSha}/comments`;
+
+            const res = await fetch(url, {
+              method: "POST",
+              headers: {
+                "Accept": "application/vnd.github+json",
+                "Authorization": `Bearer ${githubToken}`,
+                "X-GitHub-Api-Version": "2022-11-28",
+                "Content-Type": "application/json"
+              },
+              body: JSON.stringify({ body })
+            });
+
+            if (!res.ok) {
+              const text = await res.text();
+              throw new Error(`커밋 댓글 생성 실패 (${commitSha}): ${res.status} ${res.statusText}\n${text}`);
+            }
+
+            return res.json();
+          }
+
+          async function hasExistingAiComment(commitSha) {
+            const comments = await listCommitComments(commitSha);
+
+            return (comments || []).some(comment => {
+              const body = comment.body || "";
+              return body.includes(AI_COMMENT_MARKER);
+            });
+          }
+
+          function isMergeCommit(commitData) {
+            const parents = Array.isArray(commitData.parents) ? commitData.parents : [];
+            return parents.length >= 2;
+          }
+
+          function buildPrompt(commitData, selectedFiles, csFileCount, analyzableCsFileCount) {
+            const commitSha = commitData.sha;
+            const commitMessage = commitData.commit?.message || "";
+            const commitTitle = getCommitTitle(commitMessage);
+            const author = commitData.commit?.author?.name || pusher;
+
+            const fileSummaries = selectedFiles.map((file, index) => {
+              return [
+                `### File ${index + 1}`,
+                `Path: ${file.filename}`,
+                `Status: ${file.status}`,
+                `Additions: ${file.additions ?? 0}`,
+                `Deletions: ${file.deletions ?? 0}`,
+                `Changes: ${file.changes ?? 0}`,
+                "",
+                "Patch:",
+                "```diff",
+                truncate(file.patch || "[patch unavailable]", maxPatchChars),
+                "```"
+              ].join("\n");
+            }).join("\n\n");
+
+            return `
+          너는 Unity C# 병합 요약 도우미다. 대상은 초보 개발자다.
+
+          규칙:
+          - 이번 분석 대상은 하나의 merge commit이다.
+          - 제공된 C# patch만 기준으로 판단한다.
+          - patch에 없는 내용은 절대 추측하지 않는다.
+          - 코드 리뷰처럼 세세한 지적보다 "이번 병합에서 실제로 합쳐진 내용" 요약에 집중한다.
+          - 설명은 짧고 명확하게 쓴다.
+          - 초보가 바로 이해할 수 있게 작성한다.
+
+          출력 형식:
+          1. 한 줄 요약
+          2. 주요 변경점
+          3. 영향 받는 시스템
+          4. 주의할 점 (없으면 "없음")
+
+          중요:
+          - 기능 추가 / 기능 수정 / 버그 수정 / 리팩토링 중 무엇에 가까운지 자연스럽게 드러나게 쓴다.
+          - 파일 이름과 patch를 근거로 설명한다.
+          - 과장하지 않는다.
+          - patch에 없는 구조나 의도는 추측하지 않는다.
+
+          메타 정보:
+          - Repository: ${repoFullName}
+          - Branch: ${branch}
+          - Pusher: ${pusher}
+          - Commit author: ${author}
+          - Merge Commit SHA: ${commitSha}
+          - Merge Commit Title: ${commitTitle}
+          - Changed C# files in merge commit: ${csFileCount}
+          - Analyzable C# patch files in merge commit: ${analyzableCsFileCount}
+
+          분석 대상 C# 파일:
+          ${fileSummaries}
+          `.trim();
+          }
+
+          async function callOpenAI(prompt) {
+            const res = await fetch("https://api.openai.com/v1/responses", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${openaiApiKey}`
+              },
+              body: JSON.stringify({
+                model: "gpt-4.1-mini",
+                input: prompt
+              })
+            });
+
+            if (!res.ok) {
+              const text = await res.text();
+              throw new Error(`OpenAI API 실패: ${res.status} ${res.statusText}\n${text}`);
+            }
+
+            const data = await res.json();
+
+            const parts = [];
+            if (typeof data.output_text === "string" && data.output_text.trim()) {
+              parts.push(data.output_text.trim());
+            } else {
+              for (const item of data.output || []) {
+                for (const content of item.content || []) {
+                  if (content.type === "output_text" && content.text) {
+                    parts.push(content.text);
+                  }
+                }
+              }
+            }
+
+            const text = parts.join("\n").trim();
+            if (!text) throw new Error("OpenAI 응답 텍스트 추출 실패");
+
+            const usage = data.usage || {};
+            const inputTokens = usage.input_tokens || 0;
+            const outputTokens = usage.output_tokens || 0;
+
+            const estimatedCost =
+              (inputTokens / 1_000_000) * 0.80 +
+              (outputTokens / 1_000_000) * 3.20;
+
+            return {
+              text,
+              usage: {
+                inputTokens,
+                outputTokens,
+                estimatedCost
+              }
+            };
+          }
+
+          function buildFinalComment(aiText, commitData, selectedFiles, skippedCount, csFileCount, analyzableCsFileCount) {
+            const commitSha = commitData.sha;
+            const commitMessage = commitData.commit?.message || "";
+            const commitTitle = getCommitTitle(commitMessage);
+            const fileList = selectedFiles.map(f => `- \`${f.filename}\``).join("\n");
+
+            return [
+              AI_COMMENT_MARKER,
+              "## AI 병합 요약",
+              "",
+              `- 브랜치: \`${branch}\``,
+              `- 푸시한 사람: **${pusher}**`,
+              `- 병합 커밋: \`${commitSha.slice(0, 7)}\``,
+              `- 커밋 제목: **${commitTitle}**`,
+              `- 변경된 C# 파일 수: **${csFileCount}개**`,
+              `- 분석 가능한 C# patch 파일 수: **${analyzableCsFileCount}개**`,
+              `- 실제 AI 분석 C# 파일 수: **${selectedFiles.length}개**`,
+              skippedCount > 0 ? `- 분석 제외된 C# patch 파일 수: **${skippedCount}개**` : null,
+              "",
+              "### 분석한 파일",
+              fileList || "- 없음",
+              "",
+              "### 병합 요약",
+              aiText,
+              "",
+              "> 이 댓글은 GitHub Actions + OpenAI API로 자동 생성되었습니다."
+            ].filter(Boolean).join("\n");
+          }
+
+          const branchAllowed = targetBranches.includes(branch);
+          if (!branchAllowed) {
+            console.log(`브랜치 ${branch} 는 분석 대상 아님`);
+            process.exit(0);
+          }
+
+          if (pushedCommits.length === 0) {
+            console.log("push 이벤트에 커밋 정보가 없음");
+            process.exit(0);
+          }
+
+          console.log("push 커밋 수:", pushedCommits.length);
+
+          for (const pushedCommit of pushedCommits) {
+            const commitSha = pushedCommit.id;
+            if (!commitSha) continue;
+
+            console.log(`\n=== merge commit 검사 시작: ${commitSha} ===`);
+
+            const commitData = await getCommitData(commitSha);
+            const commitTitle = getCommitTitle(commitData.commit?.message || "");
+
+            if (!isMergeCommit(commitData)) {
+              console.log(`스킵: merge commit 아님 - ${commitTitle}`);
+              continue;
+            }
+
+            const alreadyCommented = await hasExistingAiComment(commitSha);
+            if (alreadyCommented) {
+              console.log(`스킵: 이미 AI merge 요약 댓글이 존재함 - ${commitSha}`);
+              continue;
+            }
+
+            const files = Array.isArray(commitData.files) ? commitData.files : [];
+
+            const csFiles = files.filter((file) => {
+              if (!file.filename) return false;
+              return shouldAnalyzeFile(file.filename);
+            });
+
+            const analyzableCsFiles = csFiles.filter((file) => !!file.patch);
+
+            const csFileCount = csFiles.length;
+            const analyzableCsFileCount = analyzableCsFiles.length;
+
+            if (analyzableCsFileCount === 0) {
+              console.log(`스킵: 분석 가능한 C# patch 파일 없음 - ${commitSha}`);
+              continue;
+            }
+
+            const selectedFiles = analyzableCsFiles.slice(0, maxFiles);
+            const skippedCount = analyzableCsFileCount - selectedFiles.length;
+
+            const prompt = buildPrompt(
+              commitData,
+              selectedFiles,
+              csFileCount,
+              analyzableCsFileCount
+            );
+
+            const aiResult = await callOpenAI(prompt);
+
+            console.log(
+              `[COST] merge_commit=${commitSha} input_tokens=${aiResult.usage.inputTokens} output_tokens=${aiResult.usage.outputTokens} estimated_usd=${aiResult.usage.estimatedCost.toFixed(6)}`
+            );
+
+            const commentBody = buildFinalComment(
+              aiResult.text,
+              commitData,
+              selectedFiles,
+              skippedCount,
+              csFileCount,
+              analyzableCsFileCount
+            );
+
+            await createCommitComment(commitSha, commentBody);
+            console.log(`AI 병합 요약 댓글 작성 완료: ${commitSha}`);
+          }
+
+          console.log("모든 merge commit 분석 완료");
+          EOF
+
+          node script.mjs
