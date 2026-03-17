@@ -287,7 +287,7 @@ jobs:
           console.log("전달받은 [AI] 커밋 SHA 목록:", filteredCommitShas);
 
           for (const commitSha of filteredCommitShas) {
-            console.log(`\n=== 커밋 분석 시작: ${commitSha} ===`);
+            console.log(`\\n=== 커밋 분석 시작: ${commitSha} ===`);
 
             const commitData = await getCommitData(commitSha);
             const commitMessage = commitData.commit?.message || "";
