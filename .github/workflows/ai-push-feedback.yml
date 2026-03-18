@@ -35,6 +35,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout caller repository head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 1
+
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
@@ -51,9 +57,11 @@ jobs:
           INPUT_MAX_FILES: ${{ inputs.max_files }}
           INPUT_MAX_PATCH_CHARS: ${{ inputs.max_patch_chars }}
           INPUT_FILTERED_COMMIT_SHAS: ${{ inputs.filtered_commit_shas }}
+          INPUT_CONTEXT_DIR: ".ai-context"
         run: |
           cat > script.mjs <<'EOF'
           import fs from "fs";
+          import path from "path";
 
           const AI_COMMENT_MARKER = "<!-- ai-push-feedback:v1 -->";
 
@@ -67,6 +75,7 @@ jobs:
           const maxFiles = Number(process.env.INPUT_MAX_FILES || "10");
           const maxPatchChars = Number(process.env.INPUT_MAX_PATCH_CHARS || "4000");
           const filteredCommitShas = JSON.parse(process.env.INPUT_FILTERED_COMMIT_SHAS || "[]");
+          const contextDir = process.env.INPUT_CONTEXT_DIR || ".ai-context";
 
           if (!repoFullName) throw new Error("GITHUB_REPOSITORY 없음");
           if (!githubToken) throw new Error("GITHUB_TOKEN 없음");
@@ -93,6 +102,364 @@ jobs:
 
           function isAiCommitTitle(commitMessage) {
             return getCommitTitle(commitMessage).startsWith("[AI]");
+          }
+
+          function readJsonSafe(filePath, fallback) {
+            try {
+              if (!fs.existsSync(filePath)) return fallback;
+              return JSON.parse(fs.readFileSync(filePath, "utf8"));
+            } catch {
+              return fallback;
+            }
+          }
+
+          function safeArray(value) {
+            return Array.isArray(value) ? value : [];
+          }
+
+          function uniq(values) {
+            return [...new Set(values.filter(Boolean))];
+          }
+
+          function limit(values, maxCount = 8) {
+            return values.slice(0, maxCount);
+          }
+
+          function shortList(values, maxCount = 8) {
+            const arr = limit(uniq(values), maxCount);
+            return arr.length > 0 ? arr.join(", ") : "-";
+          }
+
+          function formatNumberList(values, maxCount = 8) {
+            const arr = limit(safeArray(values), maxCount);
+            return arr.length > 0 ? arr.join(", ") : "-";
+          }
+
+          function loadContext() {
+            const projectProfile = readJsonSafe(path.join(contextDir, "project_profile.json"), null);
+            const filesIndex = readJsonSafe(path.join(contextDir, "files_index.json"), []);
+            const relationsIndex = readJsonSafe(path.join(contextDir, "relations_index.json"), []);
+            const riskIndex = readJsonSafe(path.join(contextDir, "risk_index.json"), []);
+            const contextMeta = readJsonSafe(path.join(contextDir, "context_meta.json"), null);
+
+            const exists =
+              !!projectProfile &&
+              Array.isArray(filesIndex) &&
+              Array.isArray(relationsIndex) &&
+              Array.isArray(riskIndex);
+
+            return {
+              exists,
+              projectProfile,
+              filesIndex,
+              relationsIndex,
+              riskIndex,
+              contextMeta
+            };
+          }
+
+          function buildContextGraph(context) {
+            const fileMetaByPath = new Map();
+            const riskByFile = new Map();
+            const classToFiles = new Map();
+            const edgesByFile = new Map();
+            const roleToFiles = new Map();
+
+            for (const meta of context.filesIndex || []) {
+              fileMetaByPath.set(meta.path, meta);
+              const riskMeta = (context.riskIndex || []).find(item => item.file_id === meta.path) || null;
+              if (riskMeta) {
+                riskByFile.set(meta.path, riskMeta);
+              }
+
+              const classNames = uniq([
+                meta.main_class_name,
+                ...safeArray(meta.classes).map(cls => cls.name)
+              ]);
+
+              for (const className of classNames) {
+                if (!classToFiles.has(className)) {
+                  classToFiles.set(className, new Set());
+                }
+                classToFiles.get(className).add(meta.path);
+              }
+
+              for (const role of safeArray(meta.guessed_roles)) {
+                if (!roleToFiles.has(role)) {
+                  roleToFiles.set(role, new Set());
+                }
+                roleToFiles.get(role).add(meta.path);
+              }
+            }
+
+            function addEdge(fromFile, toFile, detail) {
+              if (!fromFile || !toFile || fromFile === toFile) return;
+              if (!fileMetaByPath.has(fromFile) || !fileMetaByPath.has(toFile)) return;
+
+              if (!edgesByFile.has(fromFile)) {
+                edgesByFile.set(fromFile, []);
+              }
+
+              const key = `${detail.relation_type}|${detail.via}|${toFile}|${detail.direction}`;
+              const existing = edgesByFile.get(fromFile).find(item => item.key === key);
+              if (existing) return;
+
+              edgesByFile.get(fromFile).push({
+                key,
+                toFile,
+                relation_type: detail.relation_type,
+                via: detail.via,
+                strength: detail.strength,
+                direction: detail.direction
+              });
+            }
+
+            for (const relation of context.relationsIndex || []) {
+              const fromFile = relation.from_file;
+              const targetFiles = [...(classToFiles.get(relation.to_type) || [])];
+
+              for (const targetFile of targetFiles) {
+                addEdge(fromFile, targetFile, {
+                  relation_type: relation.relation_type,
+                  via: relation.to_type,
+                  strength: relation.strength || 1,
+                  direction: "out"
+                });
+
+                addEdge(targetFile, fromFile, {
+                  relation_type: `used-by:${relation.relation_type}`,
+                  via: relation.from_class || fromFile,
+                  strength: relation.strength || 1,
+                  direction: "in"
+                });
+              }
+            }
+
+            return {
+              fileMetaByPath,
+              riskByFile,
+              classToFiles,
+              edgesByFile,
+              roleToFiles
+            };
+          }
+
+          function collectRelatedMeta(startPaths, graph, options = {}) {
+            const maxDepth = options.maxDepth ?? 3;
+            const maxNodes = options.maxNodes ?? 14;
+
+            const queue = [];
+            const depthByFile = new Map();
+            const reasonsByFile = new Map();
+
+            for (const startPath of startPaths) {
+              if (!graph.fileMetaByPath.has(startPath)) continue;
+              depthByFile.set(startPath, 0);
+              reasonsByFile.set(startPath, ["변경된 파일"]);
+              queue.push(startPath);
+            }
+
+            while (queue.length > 0) {
+              const current = queue.shift();
+              const currentDepth = depthByFile.get(current) ?? 0;
+
+              if (currentDepth >= maxDepth) continue;
+
+              const edges = graph.edgesByFile.get(current) || [];
+              edges.sort((a, b) => (b.strength || 0) - (a.strength || 0));
+
+              for (const edge of edges) {
+                const nextFile = edge.toFile;
+                if (!graph.fileMetaByPath.has(nextFile)) continue;
+
+                const nextDepth = currentDepth + 1;
+                const reason = `${edge.direction === "out" ? "연결" : "역연결"}:${edge.relation_type}(${edge.via})`;
+
+                if (!depthByFile.has(nextFile)) {
+                  depthByFile.set(nextFile, nextDepth);
+                  reasonsByFile.set(nextFile, [reason]);
+                  queue.push(nextFile);
+                } else {
+                  const existingDepth = depthByFile.get(nextFile);
+                  if (nextDepth < existingDepth) {
+                    depthByFile.set(nextFile, nextDepth);
+                    queue.push(nextFile);
+                  }
+                  const reasons = reasonsByFile.get(nextFile) || [];
+                  if (!reasons.includes(reason)) {
+                    reasons.push(reason);
+                    reasonsByFile.set(nextFile, reasons);
+                  }
+                }
+              }
+            }
+
+            const startRoleSet = new Set();
+            for (const startPath of startPaths) {
+              const meta = graph.fileMetaByPath.get(startPath);
+              for (const role of safeArray(meta?.guessed_roles)) {
+                startRoleSet.add(role);
+              }
+            }
+
+            if (depthByFile.size < maxNodes) {
+              const candidates = [];
+
+              for (const [filePath, meta] of graph.fileMetaByPath.entries()) {
+                if (depthByFile.has(filePath)) continue;
+
+                const roles = safeArray(meta.guessed_roles);
+                const overlap = roles.filter(role => startRoleSet.has(role)).length;
+                if (overlap <= 0) continue;
+
+                const riskScore = graph.riskByFile.get(filePath)?.risk_score || 0;
+                const relationCount = (graph.edgesByFile.get(filePath) || []).length;
+
+                candidates.push({
+                  filePath,
+                  overlap,
+                  riskScore,
+                  relationCount
+                });
+              }
+
+              candidates.sort((a, b) =>
+                b.overlap - a.overlap ||
+                b.riskScore - a.riskScore ||
+                b.relationCount - a.relationCount ||
+                a.filePath.localeCompare(b.filePath)
+              );
+
+              for (const item of candidates) {
+                if (depthByFile.size >= maxNodes) break;
+                depthByFile.set(item.filePath, 99);
+                reasonsByFile.set(item.filePath, ["같은 역할 태그"]);
+              }
+            }
+
+            const ordered = [...depthByFile.entries()]
+              .sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0]))
+              .map(([filePath, depth]) => ({
+                filePath,
+                depth,
+                meta: graph.fileMetaByPath.get(filePath),
+                risk: graph.riskByFile.get(filePath) || null,
+                reasons: reasonsByFile.get(filePath) || []
+              }));
+
+            return ordered;
+          }
+
+          function summarizeProjectProfile(projectProfile, contextMeta) {
+            if (!projectProfile) {
+              return "프로젝트 메타 없음";
+            }
+
+            const lines = [
+              `- 전체 C# 파일 수: ${projectProfile.total_cs_files ?? 0}`,
+              `- MonoBehaviour 파일 수: ${projectProfile.mono_behaviour_files ?? 0}`,
+              `- ScriptableObject 파일 수: ${projectProfile.scriptable_object_files ?? 0}`,
+              `- Update 사용 파일 수: ${projectProfile.files_with_update ?? 0}`,
+              `- 싱글톤 후보 수: ${projectProfile.singleton_candidates ?? 0}`,
+              `- 공통 패턴: ${shortList(safeArray(projectProfile.common_patterns), 6)}`,
+            ];
+
+            const highCoupling = safeArray(projectProfile.high_coupling_classes)
+              .slice(0, 5)
+              .map(item => `${item.class_name}(${item.relation_count + item.referenced_type_count})`);
+
+            if (highCoupling.length > 0) {
+              lines.push(`- 고결합 클래스 상위: ${highCoupling.join(", ")}`);
+            }
+
+            if (contextMeta) {
+              lines.push(`- 메타 빌드 모드: ${contextMeta.build_mode_used || "-"}`);
+              lines.push(`- 메타 기준 커밋: ${contextMeta.source_commit_sha ? String(contextMeta.source_commit_sha).slice(0, 7) : "-"}`);
+            }
+
+            return lines.join("\n");
+          }
+
+          function summarizeFileMeta(meta, riskMeta, extra = {}) {
+            const lines = [
+              `- Path: ${meta.path}`,
+              `  Class: ${meta.main_class_name || "-"}`,
+              `  UnityType: ${meta.unity_type || "None"}`,
+              `  Roles: ${shortList(safeArray(meta.guessed_roles), 6)}`,
+              `  UnityMessages: ${shortList(safeArray(meta.unity_messages), 6)}`,
+              `  SummarySignals: ${shortList(safeArray(meta.summary_signals), 6)}`,
+              `  Refs: ${shortList(safeArray(meta.referenced_types), 8)}`
+            ];
+
+            if (safeArray(meta.component_access_types).length > 0) {
+              lines.push(`  ComponentAccess: ${shortList(safeArray(meta.component_access_types), 8)}`);
+            }
+
+            if (safeArray(meta.singleton_access_types).length > 0) {
+              lines.push(`  SingletonAccess: ${shortList(safeArray(meta.singleton_access_types), 6)}`);
+            }
+
+            if (riskMeta) {
+              lines.push(`  RiskFlags: ${shortList(safeArray(riskMeta.risk_flags), 8)}`);
+              lines.push(`  RiskScore: ${riskMeta.risk_score ?? 0}`);
+            }
+
+            if (extra.reasons && extra.reasons.length > 0) {
+              lines.push(`  ConnectedBecause: ${shortList(extra.reasons, 6)}`);
+            }
+
+            return lines.join("\n");
+          }
+
+          function buildMetaPayloadForPrompt(changedPaths, context) {
+            if (!context.exists) {
+              return {
+                hasContext: false,
+                projectProfileText: "프로젝트 메타 없음",
+                changedMetaText: "프로젝트 메타 없음",
+                relatedMetaText: "프로젝트 메타 없음",
+                relatedCount: 0,
+                impactedRoles: []
+              };
+            }
+
+            const graph = buildContextGraph(context);
+
+            const changedMetaEntries = changedPaths
+              .filter(filePath => graph.fileMetaByPath.has(filePath))
+              .map(filePath => ({
+                filePath,
+                meta: graph.fileMetaByPath.get(filePath),
+                risk: graph.riskByFile.get(filePath) || null
+              }));
+
+            const relatedEntries = collectRelatedMeta(changedPaths, graph, {
+              maxDepth: 3,
+              maxNodes: 14
+            });
+
+            const relatedOnly = relatedEntries.filter(item => !changedPaths.includes(item.filePath));
+            const impactedRoles = uniq(relatedEntries.flatMap(item => safeArray(item.meta?.guessed_roles)));
+
+            const changedMetaText = changedMetaEntries.length > 0
+              ? changedMetaEntries.map(item => summarizeFileMeta(item.meta, item.risk)).join("\n\n")
+              : "변경 파일 메타 없음";
+
+            const relatedMetaText = relatedOnly.length > 0
+              ? relatedOnly
+                  .slice(0, 10)
+                  .map(item => summarizeFileMeta(item.meta, item.risk, { reasons: item.reasons }))
+                  .join("\n\n")
+              : "연관 파일 메타 없음";
+
+            return {
+              hasContext: true,
+              projectProfileText: summarizeProjectProfile(context.projectProfile, context.contextMeta),
+              changedMetaText,
+              relatedMetaText,
+              relatedCount: relatedOnly.length,
+              impactedRoles
+            };
           }
 
           async function githubFetch(url, options = {}) {
@@ -155,7 +522,7 @@ jobs:
             });
           }
 
-          function buildPrompt(commitData, selectedFiles, csFileCount, analyzableCsFileCount) {
+          function buildPrompt(commitData, selectedFiles, csFileCount, analyzableCsFileCount, metaPayload) {
             const commitSha = commitData.sha;
             const commitMessage = commitData.commit?.message || "";
             const commitTitle = getCommitTitle(commitMessage);
@@ -180,14 +547,19 @@ jobs:
             return `
           너는 Unity C# 코드 리뷰어다. 대상은 초보 개발자다.
 
+          이번 리뷰는 patch만 보는 것이 아니라, 함께 제공된 프로젝트 메타를 참고해서
+          "이번 변경이 프로젝트 전체에 어떤 영향이 갈 수 있는지"까지 분석한다.
+
           규칙:
-          - 반드시 patch에 있는 코드만 기준으로 판단한다.
-          - 없는 내용은 절대 추측하지 않는다.
+          - patch가 1순위 근거다.
+          - 프로젝트 메타는 영향 범위 / 연관 시스템 / 잠재 취약점 판단 보조 근거로만 사용한다.
+          - patch와 메타에 없는 내용은 절대 추측하지 않는다.
+          - 확실하지 않으면 "확실하지 않음"이라고 적는다.
           - 문제 없으면 "문제 없음"이라고 명확히 말한다.
           - 불필요한 칭찬은 하지 않는다.
-          - 설명은 짧고 명확하게 쓴다.
-          - 수정 가능한 형태로 말한다.
-          
+          - 초보가 바로 고칠 수 있게 설명한다.
+          - 수정 방법은 가능한 한 코드 예시나 구체적인 수정 방향으로 적는다.
+
           우선적으로 확인할 것:
           - null 참조 위험
           - Update 남용 여부
@@ -196,22 +568,46 @@ jobs:
           - 책임 분리 (한 클래스에 기능 과다)
           - 매직 넘버
           - 성능 문제 (불필요한 연산, 반복)
-          - 코드 가독성
-          
-          출력 형식:
+          - 프로젝트 전체 영향 범위
+          - 연관 시스템 초기화 순서 문제
+          - 상태 소유 클래스 / 고결합 클래스 영향
 
+          출력 형식:
           "AI로 생성되는 코멘트입니다. 참고용으로 봐주시면 감사하겠습니다." (제목)
-          1. 총평 (한 줄)
-          2. 문제점 (없으면 "문제 없음")
-          3. 수정 방법 (전체 코드보단 예시를 두고 어떤식으로 고치면 좋은지 설명)
-          
+          1. 총평
+          2. 이번 변경이 프로젝트 전체에 줄 수 있는 영향
+          3. 문제점 / 취약점 (없으면 "문제 없음")
+          4. 수정 방법 (예시 코드나 수정 방향 포함)
+          5. 추가로 확인할 부분
+
           중요:
-          - 초보가 바로 고칠 수 있게 작성한다.
           - vague한 설명 금지 ("개선 필요" 같은 말 금지)
-          - 반드시 "어떻게 고치는지" 포함한다.
-          - 세세하게 설명해준다.
-          
-          분석 대상:
+          - "어디에 영향이 갈 수 있는지"를 프로젝트 메타 기준으로 설명한다.
+          - 다만 메타만 보고 단정하지 말고, patch에 근거가 있을 때만 강하게 말한다.
+          - 세세하게 설명하되, 신입이 따라갈 수 있게 적는다.
+
+          메타 정보:
+          - Repository: ${repoFullName}
+          - Branch: ${branch}
+          - Pusher: ${pusher}
+          - Commit author: ${author}
+          - Commit SHA: ${commitSha}
+          - Commit title: ${commitTitle}
+          - Changed C# files in commit: ${csFileCount}
+          - Analyzable C# patch files in commit: ${analyzableCsFileCount}
+          - Context available: ${metaPayload.hasContext ? "yes" : "no"}
+          - Impacted role guess: ${shortList(metaPayload.impactedRoles || [], 8)}
+
+          프로젝트 전체 메타 요약:
+          ${metaPayload.projectProfileText}
+
+          변경된 파일 메타:
+          ${metaPayload.changedMetaText}
+
+          재귀적으로 연결된 연관 파일 메타:
+          ${metaPayload.relatedMetaText}
+
+          분석 대상 patch:
           ${fileSummaries}
           `.trim();
           }
@@ -270,7 +666,7 @@ jobs:
             };
           }
 
-          function buildFinalComment(aiText, commitData, selectedFiles, skippedCount, usage, csFileCount, analyzableCsFileCount) {
+          function buildFinalComment(aiText, commitData, selectedFiles, skippedCount, csFileCount, analyzableCsFileCount, metaPayload) {
             const commitSha = commitData.sha;
             const commitMessage = commitData.commit?.message || "";
             const commitTitle = getCommitTitle(commitMessage);
@@ -288,6 +684,9 @@ jobs:
               `- 분석 가능한 C# patch 파일 수: **${analyzableCsFileCount}개**`,
               `- 실제 AI 분석 C# 파일 수: **${selectedFiles.length}개**`,
               skippedCount > 0 ? `- 분석 제외된 C# patch 파일 수: **${skippedCount}개**` : null,
+              `- 프로젝트 메타 반영: **${metaPayload.hasContext ? "예" : "아니오"}**`,
+              metaPayload.hasContext ? `- 연관 메타 파일 수: **${metaPayload.relatedCount}개**` : null,
+              metaPayload.hasContext ? `- 추정 영향 역할: **${shortList(metaPayload.impactedRoles || [], 8)}**` : null,
               "",
               "### 분석한 파일",
               fileList || "- 없음",
@@ -306,6 +705,13 @@ jobs:
           if (!Array.isArray(filteredCommitShas) || filteredCommitShas.length === 0) {
             console.log("[AI] 커밋 SHA가 전달되지 않음");
             process.exit(0);
+          }
+
+          const context = loadContext();
+          if (context.exists) {
+            console.log(`[META] .ai-context 로드 완료: files=${context.filesIndex.length}, relations=${context.relationsIndex.length}, risks=${context.riskIndex.length}`);
+          } else {
+            console.log("[META] .ai-context를 찾지 못함. patch 기반 분석으로만 진행");
           }
 
           console.log("전달받은 [AI] 커밋 SHA 목록:", filteredCommitShas);
@@ -330,16 +736,12 @@ jobs:
 
             const files = commitData.files || [];
 
-            // .cs 파일만 추림
             const csFiles = files.filter((file) => {
               if (!file.filename) return false;
               return shouldAnalyzeFile(file.filename);
             });
 
-            // .cs 중에서 실제 patch가 있는 파일만 추림
-            const analyzableCsFiles = csFiles.filter((file) => {
-              return !!file.patch;
-            });
+            const analyzableCsFiles = csFiles.filter((file) => !!file.patch);
 
             const csFileCount = csFiles.length;
             const analyzableCsFileCount = analyzableCsFiles.length;
@@ -351,12 +753,16 @@ jobs:
 
             const selectedFiles = analyzableCsFiles.slice(0, maxFiles);
             const skippedCount = analyzableCsFileCount - selectedFiles.length;
+            const changedPaths = uniq(csFiles.map(file => file.filename));
+
+            const metaPayload = buildMetaPayloadForPrompt(changedPaths, context);
 
             const prompt = buildPrompt(
               commitData,
               selectedFiles,
               csFileCount,
-              analyzableCsFileCount
+              analyzableCsFileCount,
+              metaPayload
             );
 
             const aiResult = await callOpenAI(prompt);
@@ -372,7 +778,8 @@ jobs:
               selectedFiles,
               skippedCount,
               csFileCount,
-              analyzableCsFileCount
+              analyzableCsFileCount,
+              metaPayload
             );
 
             await createCommitComment(commitSha, commentBody);
