@@ -1,0 +1,1288 @@
+name: AI Build Project Context
+
+on:
+  workflow_call:
+    inputs:
+      target_branches:
+        description: "메타를 갱신할 브랜치 목록(JSON 배열 문자열)"
+        required: false
+        type: string
+        default: '["main","dev","develop"]'
+      build_mode:
+        description: "auto | incremental | full"
+        required: false
+        type: string
+        default: "auto"
+      force_rebuild:
+        description: "true면 무조건 전체 재생성"
+        required: false
+        type: boolean
+        default: false
+      context_dir:
+        description: "메타 저장 디렉토리"
+        required: false
+        type: string
+        default: ".ai-context"
+      full_rebuild_changed_files_threshold:
+        description: "변경된 C# 파일 수가 이 값 이상이면 전체 재생성"
+        required: false
+        type: number
+        default: 15
+      full_rebuild_new_files_threshold:
+        description: "새로 추가된 C# 파일 수가 이 값 이상이면 전체 재생성"
+        required: false
+        type: number
+        default: 8
+      commit_context_files:
+        description: "생성된 .ai-context 파일을 브랜치에 커밋할지 여부"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-context:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Build / refresh .ai-context
+        env:
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA: ${{ github.sha }}
+          INPUT_TARGET_BRANCHES: ${{ inputs.target_branches }}
+          INPUT_BUILD_MODE: ${{ inputs.build_mode }}
+          INPUT_FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          INPUT_CONTEXT_DIR: ${{ inputs.context_dir }}
+          INPUT_FULL_REBUILD_CHANGED_FILES_THRESHOLD: ${{ inputs.full_rebuild_changed_files_threshold }}
+          INPUT_FULL_REBUILD_NEW_FILES_THRESHOLD: ${{ inputs.full_rebuild_new_files_threshold }}
+        run: |
+          cat > context-lib.mjs <<'EOF'
+          import fs from "fs";
+          import path from "path";
+          import crypto from "crypto";
+          import { execSync } from "child_process";
+
+          export const CONTEXT_VERSION = 1;
+
+          const IGNORE_DIR_NAMES = new Set([
+            ".git",
+            ".github",
+            ".ai-context",
+            "Library",
+            "Temp",
+            "Logs",
+            "Obj",
+            "obj",
+            "bin",
+            "Build",
+            "Builds",
+            "node_modules",
+            ".vs",
+            ".idea",
+            ".vscode",
+            "PackageCache"
+          ]);
+
+          const UNITY_MESSAGE_NAMES = new Set([
+            "Awake",
+            "Start",
+            "Update",
+            "FixedUpdate",
+            "LateUpdate",
+            "OnEnable",
+            "OnDisable",
+            "OnDestroy",
+            "OnTriggerEnter",
+            "OnTriggerExit",
+            "OnCollisionEnter",
+            "OnCollisionExit",
+            "OnGUI"
+          ]);
+
+          const CSHARP_KEYWORDS = new Set([
+            "if", "for", "while", "switch", "return", "new", "class", "struct", "interface",
+            "public", "private", "protected", "internal", "static", "void", "null", "true",
+            "false", "get", "set", "using", "namespace", "async", "await", "try", "catch",
+            "finally", "throw", "this", "base", "params", "var", "default", "where", "in",
+            "out", "ref", "readonly", "const", "virtual", "override", "abstract", "sealed",
+            "partial", "yield", "break", "continue", "case", "do", "else", "foreach", "lock"
+          ]);
+
+          const COMMON_SYSTEM_TYPES = new Set([
+            "String", "Int32", "Int64", "Boolean", "Single", "Double", "Decimal", "DateTime",
+            "Task", "List", "Dictionary", "HashSet", "Queue", "Stack", "IEnumerable", "IEnumerator",
+            "Action", "Func", "Debug", "Mathf", "Time", "Random", "Transform", "GameObject",
+            "MonoBehaviour", "ScriptableObject", "SerializeField", "Header", "Range", "Tooltip"
+          ]);
+
+          function toPosix(filePath) {
+            return filePath.split(path.sep).join("/");
+          }
+
+          export function ensureDir(dirPath) {
+            fs.mkdirSync(dirPath, { recursive: true });
+          }
+
+          export function readJsonSafe(filePath, fallback) {
+            try {
+              if (!fs.existsSync(filePath)) return fallback;
+              const raw = fs.readFileSync(filePath, "utf8");
+              return JSON.parse(raw);
+            } catch {
+              return fallback;
+            }
+          }
+
+          export function writeJson(filePath, value) {
+            ensureDir(path.dirname(filePath));
+            fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n", "utf8");
+          }
+
+          export function fileExists(filePath) {
+            return fs.existsSync(filePath);
+          }
+
+          export function sha1(text) {
+            return crypto.createHash("sha1").update(text).digest("hex");
+          }
+
+          export function listCsFiles(rootDir) {
+            const results = [];
+
+            function walk(currentDir) {
+              const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+
+              for (const entry of entries) {
+                const absolutePath = path.join(currentDir, entry.name);
+
+                if (entry.isDirectory()) {
+                  if (IGNORE_DIR_NAMES.has(entry.name)) continue;
+                  walk(absolutePath);
+                  continue;
+                }
+
+                if (!entry.isFile()) continue;
+                if (!entry.name.toLowerCase().endsWith(".cs")) continue;
+
+                results.push(toPosix(path.relative(rootDir, absolutePath)));
+              }
+            }
+
+            walk(rootDir);
+            results.sort();
+            return results;
+          }
+
+          export function readTextFile(rootDir, relativePath) {
+            const absolutePath = path.join(rootDir, relativePath);
+            return fs.readFileSync(absolutePath, "utf8");
+          }
+
+          function uniqueStrings(values, maxCount = 100) {
+            return [...new Set(values.filter(Boolean))].slice(0, maxCount);
+          }
+
+          function countMatches(text, regex) {
+            return [...text.matchAll(regex)].length;
+          }
+
+          function extractUsingList(text) {
+            return uniqueStrings(
+              [...text.matchAll(/^\s*using\s+([A-Za-z0-9_.]+)\s*;/gm)].map(match => match[1]),
+              50
+            );
+          }
+
+          function extractNamespace(text) {
+            return text.match(/\bnamespace\s+([A-Za-z0-9_.]+)/)?.[1] || "";
+          }
+
+          function extractClassInfos(text) {
+            const classes = [];
+            const regex = /(?:(public|private|protected|internal)\s+)?(?:(partial)\s+)?(class|struct|interface)\s+([A-Za-z_][A-Za-z0-9_]*)(\s*<[^>{}]+>)?(?:\s*:\s*([^{\n]+))?/g;
+
+            for (const match of text.matchAll(regex)) {
+              const access = match[1] || "internal";
+              const isPartial = Boolean(match[2]);
+              const kind = match[3];
+              const name = match[4];
+              const isGeneric = Boolean(match[5]);
+              const inheritanceRaw = match[6] || "";
+
+              const inherited = inheritanceRaw
+                .split(",")
+                .map(part => part.trim())
+                .filter(Boolean)
+                .map(part => part.replace(/<.*?>/g, "").trim());
+
+              classes.push({
+                name,
+                kind,
+                access,
+                base_types: inherited,
+                interfaces: inherited.filter(item => /^I[A-Z]/.test(item)),
+                attributes: [],
+                is_partial: isPartial,
+                is_generic: isGeneric
+              });
+            }
+
+            return classes;
+          }
+
+          function extractMethods(text) {
+            const names = [];
+            const regex = /(?:(public|private|protected|internal)\s+)?(?:(static|virtual|override|sealed|async|new)\s+)*([A-Za-z_][A-Za-z0-9_<>,.\[\]?]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)/g;
+
+            for (const match of text.matchAll(regex)) {
+              const returnType = match[3];
+              const methodName = match[4];
+
+              if (CSHARP_KEYWORDS.has(methodName)) continue;
+              if (["if", "for", "while", "switch", "foreach", "catch", "lock", "using"].includes(methodName)) continue;
+              if (returnType === "return") continue;
+
+              names.push(methodName);
+            }
+
+            return uniqueStrings(names, 200);
+          }
+
+          function extractProperties(text) {
+            const properties = [];
+            const regex = /(?:(public|private|protected|internal)\s+)?([A-Za-z_][A-Za-z0-9_<>,.\[\]?]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*get\s*;\s*(?:set\s*;)?/g;
+
+            for (const match of text.matchAll(regex)) {
+              properties.push({
+                access: match[1] || "internal",
+                type: match[2],
+                name: match[3]
+              });
+            }
+
+            return properties.slice(0, 200);
+          }
+
+          function extractFields(text) {
+            const fields = [];
+            const lines = text.split(/\r?\n/);
+            let pendingSerializeField = false;
+
+            for (const rawLine of lines) {
+              const line = rawLine.trim();
+
+              if (!line) {
+                pendingSerializeField = false;
+                continue;
+              }
+
+              if (/^\[[^\]]*SerializeField[^\]]*\]/.test(line)) {
+                pendingSerializeField = true;
+                continue;
+              }
+
+              if (!line.endsWith(";")) {
+                pendingSerializeField = false;
+                continue;
+              }
+
+              if (line.includes("(")) {
+                pendingSerializeField = false;
+                continue;
+              }
+
+              if (line.startsWith("using ") || line.startsWith("return ") || line.startsWith("namespace ")) {
+                pendingSerializeField = false;
+                continue;
+              }
+
+              if (line.includes("{") || line.includes("=>")) {
+                pendingSerializeField = false;
+                continue;
+              }
+
+              const fieldMatch = line.match(/^(public|private|protected|internal)?\s*(static\s+)?(?:readonly\s+|const\s+|new\s+)?([A-Za-z_][A-Za-z0-9_<>,.\[\]?]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(=.*)?;$/);
+
+              if (!fieldMatch) {
+                pendingSerializeField = false;
+                continue;
+              }
+
+              fields.push({
+                name: fieldMatch[4],
+                type: fieldMatch[3],
+                access: fieldMatch[1] || "internal",
+                serialized: pendingSerializeField,
+                is_static: Boolean(fieldMatch[2])
+              });
+
+              pendingSerializeField = false;
+            }
+
+            return fields.slice(0, 300);
+          }
+
+          function extractStringLiterals(text) {
+            return uniqueStrings(
+              [...text.matchAll(/"([^"\r\n]{1,80})"/g)].map(match => match[1]),
+              20
+            );
+          }
+
+          function extractNumericLiterals(text) {
+            const numbers = [...text.matchAll(/\b\d+(?:\.\d+)?f?\b/g)]
+              .map(match => match[0])
+              .filter(value => value !== "0" && value !== "1");
+
+            return uniqueStrings(numbers, 20).map(value => {
+              const normalized = value.replace(/f$/i, "");
+              const parsed = Number(normalized);
+              return Number.isFinite(parsed) ? parsed : normalized;
+            });
+          }
+
+          function extractComponentAccessTypes(text) {
+            return uniqueStrings(
+              [...text.matchAll(/(?:GetComponent|GetComponents|TryGetComponent)\s*<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>/g)]
+                .map(match => match[1]),
+              50
+            );
+          }
+
+          function extractCreatedTypes(text) {
+            return uniqueStrings(
+              [...text.matchAll(/\bnew\s+([A-Z][A-Za-z0-9_]*)\s*(?:<[^>]+>)?\s*\(/g)].map(match => match[1]),
+              50
+            );
+          }
+
+          function extractSingletonAccessTypes(text) {
+            return uniqueStrings(
+              [...text.matchAll(/\b([A-Z][A-Za-z0-9_]*)\s*\.\s*Instance\b/g)].map(match => match[1]),
+              50
+            );
+          }
+
+          function extractReferencedTypes(text, classes, fields, properties) {
+            const tokens = [];
+            const ownClassNames = new Set(classes.map(item => item.name));
+
+            for (const field of fields) tokens.push(field.type);
+            for (const property of properties) tokens.push(property.type);
+            for (const match of text.matchAll(/\b([A-Z][A-Za-z0-9_]*)\b/g)) {
+              tokens.push(match[1]);
+            }
+
+            return uniqueStrings(
+              tokens
+                .map(token => token.replace(/<.*?>/g, "").replace(/\[\]/g, "").trim())
+                .filter(Boolean)
+                .filter(token => !CSHARP_KEYWORDS.has(token))
+                .filter(token => !COMMON_SYSTEM_TYPES.has(token))
+                .filter(token => !ownClassNames.has(token))
+                .filter(token => token.length > 1),
+              200
+            );
+          }
+
+          function roleScoreFromTokens(text, referencedTypes, classNames) {
+            const lower = text.toLowerCase();
+            const sourceTokens = [...referencedTypes, ...classNames].join(" ").toLowerCase();
+
+            const rules = {
+              ui: ["button", "canvas", "image", "slider", "tmp_text", "textmeshpro", "recttransform", "ui", "dropdown", "scrollrect"],
+              player: ["player", "jump", "move", "input", "charactercontroller"],
+              inventory: ["inventory", "item", "slot", "equip", "bag"],
+              combat: ["attack", "damage", "enemy", "hp", "hit", "projectile", "combat"],
+              "save-load": ["save", "load", "json", "serialize", "deserialize", "playerprefs", "binaryformatter"],
+              manager: ["manager", "instance", "dontdestroyonload"],
+              network: ["network", "socket", "rpc", "sync", "server", "client"],
+              scene: ["scenemanager", "scene", "loadscene"],
+              data: ["data", "config", "table", "scriptableobject"],
+              runtime: ["monobehaviour", "update", "awake", "start"]
+            };
+
+            const scores = {};
+            for (const [role, tokens] of Object.entries(rules)) {
+              let score = 0;
+              for (const token of tokens) {
+                if (lower.includes(token)) score += 2;
+                if (sourceTokens.includes(token)) score += 1;
+              }
+              if (score > 0) scores[role] = score;
+            }
+
+            return scores;
+          }
+
+          function buildSummarySignals(meta) {
+            const signals = [];
+
+            if (meta.unity_type === "MonoBehaviour") signals.push("런타임 컴포넌트");
+            if (meta.unity_type === "ScriptableObject") signals.push("데이터 자산 중심 구조");
+            if (meta.has_update) signals.push("Update 기반 처리 존재");
+            if (meta.has_fixed_update) signals.push("물리 타이밍 처리 가능성");
+            if (meta.serialize_field_count > 0) signals.push("인스펙터 직렬화 필드 사용");
+            if (meta.singleton_candidate) signals.push("싱글톤 후보");
+            if (meta.guessed_roles.includes("ui")) signals.push("UI 관련 로직 포함");
+            if (meta.guessed_roles.includes("inventory")) signals.push("인벤토리 계열 로직 포함");
+            if (meta.guessed_roles.includes("combat")) signals.push("전투 계열 로직 포함");
+            if (meta.guessed_roles.includes("save-load")) signals.push("저장/불러오기 관련 로직 포함");
+            if (meta.get_component_count > 0) signals.push("컴포넌트 조회 사용");
+            if (meta.find_call_count > 0) signals.push("Find 계열 탐색 사용");
+
+            return uniqueStrings(signals, 8);
+          }
+
+          export function parseCsFileMeta(filePath, sourceText) {
+            const usingList = extractUsingList(sourceText);
+            const namespaceName = extractNamespace(sourceText);
+            const classes = extractClassInfos(sourceText);
+            const methods = extractMethods(sourceText);
+            const fields = extractFields(sourceText);
+            const properties = extractProperties(sourceText);
+            const classNames = classes.map(item => item.name);
+            const unityMessages = methods.filter(name => UNITY_MESSAGE_NAMES.has(name));
+            const componentAccessTypes = extractComponentAccessTypes(sourceText);
+            const createdTypes = extractCreatedTypes(sourceText);
+            const singletonAccessTypes = extractSingletonAccessTypes(sourceText);
+            const referencedTypes = extractReferencedTypes(sourceText, classes, fields, properties);
+            const roleScores = roleScoreFromTokens(
+              sourceText,
+              [...referencedTypes, ...componentAccessTypes, ...createdTypes, ...singletonAccessTypes],
+              classNames
+            );
+
+            const guessedRoles = Object.entries(roleScores)
+              .filter(([, score]) => score >= 2)
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 5)
+              .map(([role]) => role);
+
+            const lineCount = sourceText.split(/\r?\n/).length;
+            const mainClass = classes.find(item => item.access === "public") || classes[0] || null;
+            const inheritedTypes = mainClass?.base_types || [];
+            const unityType = inheritedTypes.includes("MonoBehaviour")
+              ? "MonoBehaviour"
+              : inheritedTypes.includes("ScriptableObject")
+                ? "ScriptableObject"
+                : "None";
+
+            const serializeFieldCount = fields.filter(field => field.serialized).length;
+            const publicFieldCount = fields.filter(field => field.access === "public").length;
+            const getComponentCount = countMatches(sourceText, /\b(?:GetComponent|GetComponents|TryGetComponent)\s*</g);
+            const findCallCount = countMatches(sourceText, /\b(?:FindObjectOfType|FindAnyObjectByType|GameObject\.Find|Transform\.Find|Find\()\b/g);
+            const newKeywordCount = countMatches(sourceText, /\bnew\s+[A-Z][A-Za-z0-9_]*/g);
+            const coroutineCount = countMatches(sourceText, /\b(?:StartCoroutine|IEnumerator)\b/g);
+            const dontDestroyOnLoad = /DontDestroyOnLoad\s*\(/.test(sourceText);
+            const singletonCandidate =
+              /\bstatic\s+[A-Za-z0-9_<>,.\[\]?]+\s+Instance\b/.test(sourceText) ||
+              /\bpublic\s+static\s+[A-Za-z0-9_<>,.\[\]?]+\s+Instance\b/.test(sourceText) ||
+              dontDestroyOnLoad;
+
+            const meta = {
+              file_id: filePath,
+              path: filePath,
+              file_name: path.posix.basename(filePath),
+              content_hash: sha1(sourceText),
+              size: Buffer.byteLength(sourceText, "utf8"),
+              line_count: lineCount,
+              namespace: namespaceName,
+              using_list: usingList,
+              classes,
+              main_class_name: mainClass?.name || path.posix.basename(filePath, ".cs"),
+              unity_type: unityType,
+              methods,
+              fields,
+              properties,
+              events: [],
+              unity_messages: unityMessages,
+              has_update: unityMessages.includes("Update"),
+              has_fixed_update: unityMessages.includes("FixedUpdate"),
+              has_late_update: unityMessages.includes("LateUpdate"),
+              has_awake: unityMessages.includes("Awake"),
+              has_start: unityMessages.includes("Start"),
+              has_on_enable: unityMessages.includes("OnEnable"),
+              has_on_disable: unityMessages.includes("OnDisable"),
+              serialize_field_count: serializeFieldCount,
+              public_field_count: publicFieldCount,
+              get_component_count: getComponentCount,
+              find_call_count: findCallCount,
+              new_keyword_count: newKeywordCount,
+              coroutine_count: coroutineCount,
+              singleton_candidate: singletonCandidate,
+              dont_destroy_on_load: dontDestroyOnLoad,
+              referenced_types: referencedTypes,
+              component_access_types: componentAccessTypes,
+              created_types: createdTypes,
+              singleton_access_types: singletonAccessTypes,
+              string_literals: extractStringLiterals(sourceText),
+              numeric_literals: extractNumericLiterals(sourceText),
+              guessed_roles: guessedRoles,
+              summary_signals: []
+            };
+
+            meta.summary_signals = buildSummarySignals(meta);
+            return meta;
+          }
+
+          export function buildRelationsIndex(filesIndex) {
+            const relations = [];
+
+            for (const fileMeta of filesIndex) {
+              const mainClassName = fileMeta.main_class_name;
+
+              for (const classInfo of fileMeta.classes) {
+                for (const baseType of classInfo.base_types || []) {
+                  if (!baseType) continue;
+
+                  relations.push({
+                    from_file: fileMeta.path,
+                    from_class: classInfo.name,
+                    to_type: baseType,
+                    relation_type: /^I[A-Z]/.test(baseType) ? "implements" : "inherits",
+                    strength: 4
+                  });
+                }
+              }
+
+              for (const typeName of fileMeta.referenced_types || []) {
+                relations.push({
+                  from_file: fileMeta.path,
+                  from_class: mainClassName,
+                  to_type: typeName,
+                  relation_type: "uses",
+                  strength: 1
+                });
+              }
+
+              for (const typeName of fileMeta.component_access_types || []) {
+                relations.push({
+                  from_file: fileMeta.path,
+                  from_class: mainClassName,
+                  to_type: typeName,
+                  relation_type: "component-access",
+                  strength: 3
+                });
+              }
+
+              for (const typeName of fileMeta.created_types || []) {
+                relations.push({
+                  from_file: fileMeta.path,
+                  from_class: mainClassName,
+                  to_type: typeName,
+                  relation_type: "creates",
+                  strength: 2
+                });
+              }
+
+              for (const typeName of fileMeta.singleton_access_types || []) {
+                relations.push({
+                  from_file: fileMeta.path,
+                  from_class: mainClassName,
+                  to_type: typeName,
+                  relation_type: "singleton-access",
+                  strength: 4
+                });
+              }
+            }
+
+            return uniqueRelations(relations);
+          }
+
+          function uniqueRelations(relations) {
+            const map = new Map();
+
+            for (const relation of relations) {
+              const key = `${relation.from_file}::${relation.from_class}::${relation.to_type}::${relation.relation_type}`;
+              const existing = map.get(key);
+
+              if (!existing || existing.strength < relation.strength) {
+                map.set(key, relation);
+              }
+            }
+
+            return [...map.values()].sort((a, b) => {
+              return a.from_file.localeCompare(b.from_file) ||
+                a.relation_type.localeCompare(b.relation_type) ||
+                a.to_type.localeCompare(b.to_type);
+            });
+          }
+
+          export function buildRiskIndex(filesIndex, relationsIndex) {
+            const relationCountByFile = new Map();
+            for (const relation of relationsIndex) {
+              relationCountByFile.set(
+                relation.from_file,
+                (relationCountByFile.get(relation.from_file) || 0) + 1
+              );
+            }
+
+            return filesIndex.map(fileMeta => {
+              const riskFlags = [];
+              const riskReasons = [];
+              let score = 0;
+
+              const relationCount = relationCountByFile.get(fileMeta.path) || 0;
+
+              if (fileMeta.has_update || fileMeta.has_fixed_update || fileMeta.has_late_update) {
+                riskFlags.push("update-heavy");
+                riskReasons.push("Unity 업데이트 루프 사용");
+                score += 10;
+              }
+
+              if (fileMeta.singleton_candidate) {
+                riskFlags.push("singleton-candidate");
+                riskReasons.push("Instance 또는 DontDestroyOnLoad 패턴 감지");
+                score += 15;
+              }
+
+              if (relationCount >= 20 || fileMeta.referenced_types.length >= 20) {
+                riskFlags.push("high-coupling");
+                riskReasons.push("참조 타입 또는 관계 수가 많음");
+                score += 18;
+              }
+
+              if (fileMeta.public_field_count >= 3) {
+                riskFlags.push("public-field-heavy");
+                riskReasons.push("public 필드 노출 수가 많음");
+                score += 10;
+              }
+
+              if (fileMeta.get_component_count >= 3) {
+                riskFlags.push("getcomponent-heavy");
+                riskReasons.push("GetComponent/TryGetComponent 호출이 많음");
+                score += 12;
+              }
+
+              if (fileMeta.find_call_count >= 1) {
+                riskFlags.push("find-heavy");
+                riskReasons.push("Find 계열 탐색 사용");
+                score += 12;
+              }
+
+              if (fileMeta.numeric_literals.length >= 6) {
+                riskFlags.push("magic-number-heavy");
+                riskReasons.push("숫자 리터럴이 많아 의미 파악이 어려울 수 있음");
+                score += 8;
+              }
+
+              if (fileMeta.line_count >= 300 || fileMeta.methods.length >= 18 || fileMeta.fields.length >= 18) {
+                riskFlags.push("large-class");
+                riskReasons.push("파일/메서드/필드 수가 많아 책임이 커질 가능성");
+                score += 15;
+              }
+
+              if (
+                (fileMeta.has_awake || fileMeta.has_start || fileMeta.has_on_enable) &&
+                (fileMeta.singleton_candidate || relationCount >= 12)
+              ) {
+                riskFlags.push("init-order-sensitive");
+                riskReasons.push("초기화 순서에 민감할 가능성");
+                score += 10;
+              }
+
+              if (fileMeta.guessed_roles.includes("save-load")) {
+                riskFlags.push("save-load-sensitive");
+                riskReasons.push("저장/불러오기 관련 로직 포함");
+                score += 12;
+              }
+
+              if (
+                fileMeta.guessed_roles.includes("ui") &&
+                (fileMeta.guessed_roles.includes("combat") ||
+                 fileMeta.guessed_roles.includes("player") ||
+                 fileMeta.guessed_roles.includes("runtime"))
+              ) {
+                riskFlags.push("ui-runtime-mixed");
+                riskReasons.push("UI와 런타임 책임이 한 파일에 섞였을 가능성");
+                score += 10;
+              }
+
+              if (
+                fileMeta.guessed_roles.includes("manager") ||
+                fileMeta.singleton_candidate ||
+                relationCount >= 12
+              ) {
+                riskFlags.push("state-owner");
+                riskReasons.push("상태 중심 또는 관리 중심 클래스일 가능성");
+                score += 8;
+              }
+
+              return {
+                file_id: fileMeta.path,
+                class_name: fileMeta.main_class_name,
+                risk_flags: uniqueStrings(riskFlags, 20),
+                risk_reasons: uniqueStrings(riskReasons, 20),
+                risk_score: Math.min(score, 100)
+              };
+            }).sort((a, b) => b.risk_score - a.risk_score || a.file_id.localeCompare(b.file_id));
+          }
+
+          export function buildProjectProfile(filesIndex, relationsIndex, riskIndex) {
+            const totalCsFiles = filesIndex.length;
+            const monoFiles = filesIndex.filter(item => item.unity_type === "MonoBehaviour").length;
+            const scriptableFiles = filesIndex.filter(item => item.unity_type === "ScriptableObject").length;
+            const filesWithUpdate = filesIndex.filter(item => item.has_update).length;
+            const filesWithFixedUpdate = filesIndex.filter(item => item.has_fixed_update).length;
+            const filesWithLateUpdate = filesIndex.filter(item => item.has_late_update).length;
+            const singletonCandidates = filesIndex.filter(item => item.singleton_candidate).length;
+            const managerLikeClasses = filesIndex.filter(item =>
+              item.main_class_name.toLowerCase().includes("manager") ||
+              item.guessed_roles.includes("manager")
+            ).length;
+            const uiRelatedClasses = filesIndex.filter(item => item.guessed_roles.includes("ui")).length;
+            const saveLoadRelatedClasses = filesIndex.filter(item => item.guessed_roles.includes("save-load")).length;
+
+            const roleCounts = {};
+            for (const fileMeta of filesIndex) {
+              for (const role of fileMeta.guessed_roles) {
+                roleCounts[role] = (roleCounts[role] || 0) + 1;
+              }
+            }
+
+            const relationCountByFile = new Map();
+            for (const relation of relationsIndex) {
+              relationCountByFile.set(
+                relation.from_file,
+                (relationCountByFile.get(relation.from_file) || 0) + 1
+              );
+            }
+
+            const highCouplingClasses = filesIndex
+              .map(item => ({
+                class_name: item.main_class_name,
+                file_id: item.path,
+                relation_count: relationCountByFile.get(item.path) || 0,
+                referenced_type_count: item.referenced_types.length
+              }))
+              .sort((a, b) => (b.relation_count + b.referenced_type_count) - (a.relation_count + a.referenced_type_count))
+              .slice(0, 10);
+
+            const commonPatterns = [];
+            if (totalCsFiles > 0 && monoFiles / totalCsFiles >= 0.5) {
+              commonPatterns.push("MonoBehaviour 중심 구조");
+            }
+            if (totalCsFiles > 0 && filesWithUpdate / totalCsFiles >= 0.15) {
+              commonPatterns.push("Update 사용 빈도 높음");
+            }
+            if (managerLikeClasses >= 5) {
+              commonPatterns.push("Manager 성격 클래스 다수");
+            }
+            if (singletonCandidates >= 3) {
+              commonPatterns.push("싱글톤 후보 클래스 다수");
+            }
+            if (highCouplingClasses.some(item => item.relation_count >= 20)) {
+              commonPatterns.push("고결합 클래스 존재");
+            }
+
+            return {
+              project_name: "unknown",
+              language: "C#",
+              engine_guess: "Unity",
+              total_cs_files: totalCsFiles,
+              mono_behaviour_files: monoFiles,
+              scriptable_object_files: scriptableFiles,
+              files_with_update: filesWithUpdate,
+              files_with_fixed_update: filesWithFixedUpdate,
+              files_with_late_update: filesWithLateUpdate,
+              singleton_candidates: singletonCandidates,
+              manager_like_classes: managerLikeClasses,
+              ui_related_classes: uiRelatedClasses,
+              save_load_related_classes: saveLoadRelatedClasses,
+              role_counts: roleCounts,
+              high_coupling_classes: highCouplingClasses,
+              high_risk_classes: riskIndex.slice(0, 10),
+              common_patterns: commonPatterns
+            };
+          }
+
+          export function loadExistingContext(contextDir) {
+            return {
+              project_profile: readJsonSafe(path.join(contextDir, "project_profile.json"), null),
+              files_index: readJsonSafe(path.join(contextDir, "files_index.json"), []),
+              relations_index: readJsonSafe(path.join(contextDir, "relations_index.json"), []),
+              risk_index: readJsonSafe(path.join(contextDir, "risk_index.json"), []),
+              context_meta: readJsonSafe(path.join(contextDir, "context_meta.json"), null)
+            };
+          }
+
+          export function isContextMissing(contextDir) {
+            const required = [
+              "project_profile.json",
+              "files_index.json",
+              "relations_index.json",
+              "risk_index.json",
+              "context_meta.json"
+            ];
+
+            return required.some(fileName => !fileExists(path.join(contextDir, fileName)));
+          }
+
+          export function runGit(command, options = {}) {
+            return execSync(command, {
+              encoding: "utf8",
+              stdio: ["ignore", "pipe", "pipe"],
+              ...options
+            }).trim();
+          }
+
+          export function getChangedCsFiles(beforeSha, afterSha) {
+            if (!beforeSha || !afterSha) {
+              return {
+                changed: [],
+                added: [],
+                deleted: [],
+                modified: [],
+                mode: "full-fallback",
+                reason: "before/after SHA가 없음"
+              };
+            }
+
+            if (/^0+$/.test(beforeSha)) {
+              return {
+                changed: [],
+                added: [],
+                deleted: [],
+                modified: [],
+                mode: "full-fallback",
+                reason: "before SHA가 zero hash라 전체 재생성 필요"
+              };
+            }
+
+            let raw = "";
+            try {
+              raw = runGit(`git diff --name-status ${beforeSha} ${afterSha} -- '*.cs'`);
+            } catch (error) {
+              return {
+                changed: [],
+                added: [],
+                deleted: [],
+                modified: [],
+                mode: "full-fallback",
+                reason: "git diff 실패"
+              };
+            }
+
+            const changed = [];
+            const added = [];
+            const deleted = [];
+            const modified = [];
+
+            for (const line of raw.split(/\r?\n/)) {
+              if (!line.trim()) continue;
+              const [status, filePath] = line.split(/\t+/);
+              const normalizedPath = toPosix(filePath || "");
+
+              if (!normalizedPath.toLowerCase().endsWith(".cs")) continue;
+
+              changed.push(normalizedPath);
+
+              if (status === "A") added.push(normalizedPath);
+              else if (status === "D") deleted.push(normalizedPath);
+              else modified.push(normalizedPath);
+            }
+
+            return {
+              changed: uniqueStrings(changed, 5000),
+              added: uniqueStrings(added, 5000),
+              deleted: uniqueStrings(deleted, 5000),
+              modified: uniqueStrings(modified, 5000),
+              mode: "diff",
+              reason: "git diff 기준"
+            };
+          }
+
+          export function createContextMeta({
+            sourceBranch,
+            sourceCommitSha,
+            buildModeRequested,
+            buildModeUsed,
+            rebuildReasons,
+            totalCsFiles,
+            changedCsFiles,
+            addedCsFiles,
+            deletedCsFiles
+          }) {
+            return {
+              version: CONTEXT_VERSION,
+              generated_at: new Date().toISOString(),
+              generator: "ai-context-builder-v1",
+              source_branch: sourceBranch,
+              source_commit_sha: sourceCommitSha,
+              build_mode_requested: buildModeRequested,
+              build_mode_used: buildModeUsed,
+              rebuild_reasons: rebuildReasons,
+              total_cs_files: totalCsFiles,
+              changed_cs_files: changedCsFiles,
+              added_cs_files: addedCsFiles,
+              deleted_cs_files: deletedCsFiles,
+              index_status: "ready"
+            };
+          }
+
+          export function buildRelationGraph(relationsIndex, filesIndex) {
+            const classToFile = new Map();
+            const adjacency = new Map();
+
+            for (const fileMeta of filesIndex) {
+              classToFile.set(fileMeta.main_class_name, fileMeta.path);
+              for (const classInfo of fileMeta.classes || []) {
+                classToFile.set(classInfo.name, fileMeta.path);
+              }
+            }
+
+            for (const relation of relationsIndex) {
+              const fromFile = relation.from_file;
+              const toFile = classToFile.get(relation.to_type);
+              if (!toFile) continue;
+              if (fromFile === toFile) continue;
+
+              if (!adjacency.has(fromFile)) adjacency.set(fromFile, new Set());
+              adjacency.get(fromFile).add(toFile);
+            }
+
+            return adjacency;
+          }
+
+          export function collectRelatedContext({
+            seedFilePaths,
+            filesIndex,
+            relationsIndex,
+            riskIndex,
+            maxDepth = 2,
+            maxNodes = 20
+          }) {
+            const filesByPath = new Map(filesIndex.map(item => [item.path, item]));
+            const riskByPath = new Map(riskIndex.map(item => [item.file_id, item]));
+            const graph = buildRelationGraph(relationsIndex, filesIndex);
+            const visited = new Set();
+            const queue = [];
+
+            for (const filePath of seedFilePaths) {
+              if (!filesByPath.has(filePath)) continue;
+              visited.add(filePath);
+              queue.push({ path: filePath, depth: 0 });
+            }
+
+            const result = [];
+
+            while (queue.length > 0 && result.length < maxNodes) {
+              const current = queue.shift();
+              const fileMeta = filesByPath.get(current.path);
+              if (!fileMeta) continue;
+
+              result.push({
+                path: current.path,
+                depth: current.depth,
+                file_meta: fileMeta,
+                risk_meta: riskByPath.get(current.path) || null
+              });
+
+              if (current.depth >= maxDepth) continue;
+
+              const neighbors = [...(graph.get(current.path) || [])];
+              for (const neighbor of neighbors) {
+                if (visited.has(neighbor)) continue;
+                visited.add(neighbor);
+                queue.push({ path: neighbor, depth: current.depth + 1 });
+              }
+            }
+
+            return result;
+          }
+          EOF
+
+          cat > build-context.mjs <<'EOF'
+          import fs from "fs";
+          import path from "path";
+          import {
+            ensureDir,
+            listCsFiles,
+            readTextFile,
+            parseCsFileMeta,
+            buildRelationsIndex,
+            buildRiskIndex,
+            buildProjectProfile,
+            loadExistingContext,
+            isContextMissing,
+            writeJson,
+            getChangedCsFiles,
+            createContextMeta
+          } from "./context-lib.mjs";
+
+          const repoRoot = process.cwd();
+          const eventPath = process.env.GITHUB_EVENT_PATH || "";
+          const branchName = process.env.GITHUB_REF_NAME || "";
+          const commitSha = process.env.GITHUB_SHA || "";
+          const targetBranches = JSON.parse(process.env.INPUT_TARGET_BRANCHES || '["main","dev","develop"]');
+          const buildModeInput = (process.env.INPUT_BUILD_MODE || "auto").trim();
+          const forceRebuild = String(process.env.INPUT_FORCE_REBUILD || "false") === "true";
+          const contextDirName = process.env.INPUT_CONTEXT_DIR || ".ai-context";
+          const fullRebuildChangedThreshold = Number(process.env.INPUT_FULL_REBUILD_CHANGED_FILES_THRESHOLD || "15");
+          const fullRebuildNewFilesThreshold = Number(process.env.INPUT_FULL_REBUILD_NEW_FILES_THRESHOLD || "8");
+
+          const contextDir = path.join(repoRoot, contextDirName);
+
+          function readEventJson(filePath) {
+            if (!filePath || !fs.existsSync(filePath)) return {};
+            try {
+              return JSON.parse(fs.readFileSync(filePath, "utf8"));
+            } catch {
+              return {};
+            }
+          }
+
+          function buildPlan({ event, currentFiles, existingContextMissing }) {
+            const rebuildReasons = [];
+            const beforeSha = event.before || "";
+            const afterSha = event.after || "";
+            const diffInfo = getChangedCsFiles(beforeSha, afterSha);
+
+            if (existingContextMissing) {
+              rebuildReasons.push("기존 .ai-context가 없음");
+            }
+
+            if (forceRebuild) {
+              rebuildReasons.push("force_rebuild=true");
+            }
+
+            if (buildModeInput === "full") {
+              rebuildReasons.push("build_mode=full");
+            }
+
+            if (diffInfo.mode === "full-fallback" && !existingContextMissing && buildModeInput !== "incremental" && buildModeInput !== "full") {
+              rebuildReasons.push(diffInfo.reason);
+            }
+
+            const changedCount = diffInfo.changed.length;
+            const newCount = diffInfo.added.length;
+            const deletedCount = diffInfo.deleted.length;
+
+            let buildModeUsed = "incremental";
+
+            if (existingContextMissing || forceRebuild || buildModeInput === "full") {
+              buildModeUsed = "full";
+            } else if (buildModeInput === "incremental") {
+              buildModeUsed = "incremental";
+            } else if (buildModeInput === "auto") {
+              if (diffInfo.mode === "full-fallback") {
+                buildModeUsed = "full";
+              } else if (changedCount >= fullRebuildChangedThreshold) {
+                buildModeUsed = "full";
+                rebuildReasons.push(`변경된 C# 파일 수가 임계치 이상 (${changedCount})`);
+              } else if (newCount >= fullRebuildNewFilesThreshold) {
+                buildModeUsed = "full";
+                rebuildReasons.push(`신규 C# 파일 수가 임계치 이상 (${newCount})`);
+              } else {
+                buildModeUsed = "incremental";
+              }
+            } else {
+              buildModeUsed = "full";
+              rebuildReasons.push("알 수 없는 build_mode 값");
+            }
+
+            if (buildModeUsed === "incremental" && changedCount === 0 && !existingContextMissing) {
+              rebuildReasons.push("변경된 C# 파일이 없어 incremental 업데이트 스킵");
+            }
+
+            return {
+              buildModeUsed,
+              rebuildReasons,
+              diffInfo,
+              changedCount,
+              newCount,
+              deletedCount,
+              currentFiles
+            };
+          }
+
+          function mergeFilesIndex({
+            oldFilesIndex,
+            parsedChangedFiles,
+            currentFiles,
+            buildModeUsed
+          }) {
+            if (buildModeUsed === "full") {
+              return currentFiles
+                .map(filePath => parsedChangedFiles.get(filePath))
+                .filter(Boolean)
+                .sort((a, b) => a.path.localeCompare(b.path));
+            }
+
+            const oldMap = new Map(oldFilesIndex.map(item => [item.path, item]));
+            for (const filePath of currentFiles) {
+              if (parsedChangedFiles.has(filePath)) {
+                oldMap.set(filePath, parsedChangedFiles.get(filePath));
+              }
+            }
+
+            for (const oldPath of [...oldMap.keys()]) {
+              if (!currentFiles.includes(oldPath)) {
+                oldMap.delete(oldPath);
+              }
+            }
+
+            return [...oldMap.values()].sort((a, b) => a.path.localeCompare(b.path));
+          }
+
+          function collectFilesToParse(plan, existingContext) {
+            if (plan.buildModeUsed === "full") {
+              return plan.currentFiles;
+            }
+
+            const existingPaths = new Set((existingContext.files_index || []).map(item => item.path));
+            const filesToParse = new Set(plan.diffInfo.changed);
+
+            for (const filePath of plan.currentFiles) {
+              if (!existingPaths.has(filePath)) filesToParse.add(filePath);
+            }
+
+            return [...filesToParse].sort();
+          }
+
+          function main() {
+            if (targetBranches.length > 0 && !targetBranches.includes(branchName)) {
+              console.log(`브랜치 ${branchName} 는 대상 브랜치가 아니므로 스킵`);
+              return;
+            }
+
+            const event = readEventJson(eventPath);
+            const currentFiles = listCsFiles(repoRoot);
+            const existingContextMissing = isContextMissing(contextDir);
+            const existingContext = loadExistingContext(contextDir);
+
+            ensureDir(contextDir);
+
+            const plan = buildPlan({
+              event,
+              currentFiles,
+              existingContextMissing
+            });
+
+            if (
+              plan.buildModeUsed === "incremental" &&
+              plan.changedCount === 0 &&
+              !existingContextMissing &&
+              !forceRebuild
+            ) {
+              console.log("변경된 C# 파일이 없어 메타 갱신을 스킵합니다.");
+              return;
+            }
+
+            const filesToParse = collectFilesToParse(plan, existingContext);
+            const parsedChangedFiles = new Map();
+
+            for (const filePath of filesToParse) {
+              try {
+                const sourceText = readTextFile(repoRoot, filePath);
+                const fileMeta = parseCsFileMeta(filePath, sourceText);
+                parsedChangedFiles.set(filePath, fileMeta);
+              } catch (error) {
+                console.error(`파일 파싱 실패: ${filePath}`);
+                console.error(error);
+              }
+            }
+
+            const filesIndex = mergeFilesIndex({
+              oldFilesIndex: existingContext.files_index || [],
+              parsedChangedFiles,
+              currentFiles,
+              buildModeUsed: plan.buildModeUsed
+            });
+
+            const relationsIndex = buildRelationsIndex(filesIndex);
+            const riskIndex = buildRiskIndex(filesIndex, relationsIndex);
+            const projectProfile = buildProjectProfile(filesIndex, relationsIndex, riskIndex);
+            const contextMeta = createContextMeta({
+              sourceBranch: branchName,
+              sourceCommitSha: commitSha,
+              buildModeRequested: buildModeInput,
+              buildModeUsed: plan.buildModeUsed,
+              rebuildReasons: plan.rebuildReasons,
+              totalCsFiles: currentFiles.length,
+              changedCsFiles: plan.changedCount,
+              addedCsFiles: plan.newCount,
+              deletedCsFiles: plan.deletedCount
+            });
+
+            writeJson(path.join(contextDir, "project_profile.json"), projectProfile);
+            writeJson(path.join(contextDir, "files_index.json"), filesIndex);
+            writeJson(path.join(contextDir, "relations_index.json"), relationsIndex);
+            writeJson(path.join(contextDir, "risk_index.json"), riskIndex);
+            writeJson(path.join(contextDir, "context_meta.json"), contextMeta);
+
+            console.log("=== CONTEXT BUILD RESULT ===");
+            console.log(`build_mode_used: ${plan.buildModeUsed}`);
+            console.log(`files_total: ${currentFiles.length}`);
+            console.log(`files_parsed: ${filesToParse.length}`);
+            console.log(`changed_cs_files: ${plan.changedCount}`);
+            console.log(`added_cs_files: ${plan.newCount}`);
+            console.log(`deleted_cs_files: ${plan.deletedCount}`);
+            console.log(`context_dir: ${contextDirName}`);
+
+            if (plan.rebuildReasons.length > 0) {
+              console.log("rebuild_reasons:");
+              for (const reason of plan.rebuildReasons) {
+                console.log(`- ${reason}`);
+              }
+            }
+
+            const summaryFilePath = path.join(contextDir, "context_build_report.json");
+            writeJson(summaryFilePath, {
+              build_mode_used: plan.buildModeUsed,
+              files_total: currentFiles.length,
+              files_parsed: filesToParse.length,
+              changed_cs_files: plan.changedCount,
+              added_cs_files: plan.newCount,
+              deleted_cs_files: plan.deletedCount,
+              rebuild_reasons: plan.rebuildReasons
+            });
+          }
+
+          main();
+          EOF
+
+          node build-context.mjs
+
+      - name: Show context summary
+        shell: bash
+        run: |
+          echo "## AI Context Build" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "${{ inputs.context_dir }}/context_build_report.json" ]; then
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            cat "${{ inputs.context_dir }}/context_build_report.json" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "context_build_report.json 없음" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Commit .ai-context to caller repository
+        if: ${{ inputs.commit_context_files }}
+        shell: bash
+        run: |
+          if ! git status --porcelain "${{ inputs.context_dir }}" | grep . >/dev/null 2>&1; then
+            echo "변경된 .ai-context 파일 없음"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add "${{ inputs.context_dir }}"
+          git commit -m "[skip ai-context] chore(ai-context): refresh project context"
+          git push origin "HEAD:${{ github.ref_name }}"
