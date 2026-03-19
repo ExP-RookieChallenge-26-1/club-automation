@@ -452,13 +452,29 @@ jobs:
                   .join("\n\n")
               : "연관 파일 메타 없음";
 
+            const relatedFileItems = relatedOnly
+              .slice(0, 10)
+              .map(item => ({
+                path: item.filePath,
+                reasons: item.reasons || [],
+                roles: safeArray(item.meta?.guessed_roles)
+              }));
+
+            const relatedFilesCommentText = relatedFileItems.length > 0
+              ? relatedFileItems
+                  .map(item => `- \`${item.path}\`${item.reasons.length > 0 ? ` (사유: ${shortList(item.reasons, 4)})` : ""}`)
+                  .join("\n")
+              : "연관 파일 없음";
+
             return {
               hasContext: true,
               projectProfileText: summarizeProjectProfile(context.projectProfile, context.contextMeta),
               changedMetaText,
               relatedMetaText,
               relatedCount: relatedOnly.length,
-              impactedRoles
+              impactedRoles,
+              relatedFileItems,
+              relatedFilesCommentText
             };
           }
 
@@ -690,6 +706,9 @@ jobs:
               "",
               "### 분석한 파일",
               fileList || "- 없음",
+              "",
+              metaPayload.hasContext ? "### 연관 파일" : null,
+              metaPayload.hasContext ? metaPayload.relatedFilesCommentText : null,
               "",
               "### 피드백",
               aiText,
